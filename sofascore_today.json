@@ -1,0 +1,8 @@
+[
+  {"league": "Premier League", "home": "Arsenal", "away": "Newcastle", "ts_utc": 1730193600,
+   "pace_hint": 7.9, "cards_avg": 4.3, "corners_avg": 9.2, "injuries_abs": 1},
+  {"league": "LaLiga", "home": "Sevilla", "away": "Getafe", "ts_utc": 1730186400,
+   "pace_hint": 7.4, "cards_avg": 5.1, "corners_avg": 8.6, "injuries_abs": 2},
+  {"league": "Serie A", "home": "AC Milan", "away": "Frosinone", "ts_utc": 1730200800,
+   "pace_hint": 8.2, "cards_avg": 3.8, "corners_avg": 10.1, "injuries_abs": 0}
+]

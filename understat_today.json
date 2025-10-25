@@ -1,8 +1,10 @@
 [
-  {"league": "Premier League", "home": "Arsenal", "away": "Newcastle", "ts_utc": 1730193600,
-   "home_form10": 8, "away_form10": 5, "xg_sum": 3.2},
-  {"league": "LaLiga", "home": "Sevilla", "away": "Getafe", "ts_utc": 1730186400,
-   "home_form10": 6, "away_form10": 6, "xg_sum": 2.4},
-  {"league": "Serie A", "home": "AC Milan", "away": "Frosinone", "ts_utc": 1730200800,
-   "home_form10": 9, "away_form10": 3, "xg_sum": 3.8}
+  {"league":"Premier League","home":"Arsenal","away":"Newcastle","ts_utc":1730193600,
+   "home_form10":8.0,"away_form10":5.0,"xg_sum":3.20},
+
+  {"league":"LaLiga","home":"Sevilla","away":"Getafe","ts_utc":1730186400,
+   "home_form10":6.5,"away_form10":4.0,"xg_sum":2.45},
+
+  {"league":"Serie A","home":"AC Milan","away":"Frosinone","ts_utc":1730200800,
+   "home_form10":8.8,"away_form10":3.8,"xg_sum":3.60}
 ]

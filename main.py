@@ -1,7 +1,8 @@
-# main.py — Telegram bot KikiTipy (Render webhook + fallback polling) — PTB 21.x
+# main.py — Kiki Tipy bot (Render webhook + fallback polling) • PTB 21.x
 import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from tip_engine import suggest_today  # náš mozek pro /tip
 
 # --- ENV ---
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -23,10 +24,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Bot běží\nRežim: webhook/polling (auto)\nTZ: Europe/Prague")
 
 async def cmd_tip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🔒 Bezpečnostní tiket\n• Hokej — 2. třetina góly: Over 1.5\n  Důvěra: 86%\n\n"
-        "⚠️ Risk tiket\n• Fotbal — gól do poločasu: ANO\n  Důvěra: 72%"
-    )
+    text = suggest_today()
+    await update.message.reply_text(text)
 
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
@@ -37,13 +36,13 @@ def main():
 
     path = f"webhook/{TOKEN}"
 
-    # Když nemáme veřejnou URL (nebo běží lokálně), spustíme polling
+    # Když nemáme veřejnou URL, spustíme POLLING (jede i lokálně)
     if not PUBLIC_URL or PUBLIC_URL == "https://":
         print("⚠️ PUBLIC_URL nenalezen – spouštím POLLING mód.")
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
         return
 
-    # Webhook režim (Render) – PTB sám nastaví webhook
+    # WEBHOOK režim (Render). PTB nastaví webhook a spustí vestavěný server.
     print(f"✅ Spouštím WEBHOOK: {PUBLIC_URL}/{path}")
     app.run_webhook(
         listen="0.0.0.0",

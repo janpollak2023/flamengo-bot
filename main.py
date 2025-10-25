@@ -4,43 +4,57 @@ import json
 import traceback
 from flask import Flask, request, jsonify
 
-# --- Safe import z tip_engine ----------------------------------------------
-# Počítáme s tím, že suggest_full může chybět.
+# ----------------- Bezpečné importy z tip_engine -----------------
+# 'suggest_today' bereme jako povinné (jinak nemá app co vracet).
 try:
-    from tip_engine import suggest_today, debug_report  # jisté funkce
+    from tip_engine import suggest_today
 except Exception as e:
-    raise ImportError("Nepodařilo se importovat 'suggest_today' nebo 'debug_report' z tip_engine: " + str(e))
+    raise ImportError("Chybí povinná funkce 'suggest_today' v tip_engine: " + str(e))
 
+# Volitelné funkce:
 try:
-    from tip_engine import suggest_full  # volitelná funkce
+    from tip_engine import suggest_full
     HAS_SUGGEST_FULL = True
 except Exception:
     suggest_full = None
     HAS_SUGGEST_FULL = False
 
-# --- Pomocné funkce ---------------------------------------------------------
+try:
+    from tip_engine import debug_report
+    HAS_DEBUG_REPORT = True
+except Exception:
+    debug_report = None
+    HAS_DEBUG_REPORT = False
+
+# ----------------- Pomocná routovací logika -----------------
 def run_suggest(mode: str):
     """
-    Vrátí data podle zvoleného režimu.
     mode: 'today' | 'full' | 'debug'
     """
+    mode = (mode or "today").lower()
+
     if mode == "today":
         return suggest_today()
+
     if mode == "full":
         if HAS_SUGGEST_FULL and callable(suggest_full):
             return suggest_full()
-        # Fallback: když suggest_full není, vrátíme today + hlášku
         return {
-            "warning": "suggest_full není dostupné v tip_engine – vracím fallback na suggest_today.",
-            "data": suggest_today()
+            "warning": "suggest_full není dostupné v tip_engine – vrácen fallback na suggest_today.",
+            "data": suggest_today(),
         }
-    if mode == "debug":
-        return debug_report()
 
-    # default
+    if mode == "debug":
+        if HAS_DEBUG_REPORT and callable(debug_report):
+            return debug_report()
+        return {
+            "warning": "debug_report není dostupné v tip_engine – použijte mode=today nebo full.",
+            "data": suggest_today(),
+        }
+
     return {"error": "Neplatný mode. Použijte: today | full | debug"}
 
-# --- Flask aplikace ---------------------------------------------------------
+# ----------------- Flask app -----------------
 app = Flask(__name__)
 
 @app.get("/healthz")
@@ -53,19 +67,19 @@ def index():
         "service": "tip-engine-api",
         "endpoints": {
             "/healthz": "healthcheck",
-            "/suggest?mode=today|full|debug": "vrátí JSON s výstupem engine"
+            "/suggest?mode=today|full|debug": "JSON výstup engine"
         },
-        "has_suggest_full": HAS_SUGGEST_FULL
+        "has_suggest_full": HAS_SUGGEST_FULL,
+        "has_debug_report": HAS_DEBUG_REPORT,
     })
 
 @app.get("/suggest")
 def suggest():
-    mode = request.args.get("mode", "today").lower()
+    mode = request.args.get("mode", "today")
     try:
         out = run_suggest(mode)
-        # pokud výstup není JSON-serializable, zkusíme převést na string
         try:
-            json.dumps(out)
+            json.dumps(out)  # ověří serializovatelnost
             return jsonify(out), 200
         except TypeError:
             return jsonify({"result": str(out)}), 200
@@ -76,17 +90,14 @@ def suggest():
             "trace": traceback.format_exc()
         }), 500
 
-# --- Hlavní vstup -----------------------------------------------------------
+# ----------------- Spuštění -----------------
 if __name__ == "__main__":
-    # Pokud Render spouští jako web (má proměnnou PORT), naběhne server.
-    # Jinak to umí i CLI režim (vypíše návrh a skončí).
     port = int(os.getenv("PORT", "0"))
     if port > 0:
-        # Web mód pro Render
         app.run(host="0.0.0.0", port=port, threaded=True)
     else:
-        # CLI mód (užitečné pro lokální test)
-        mode = os.getenv("MODE", "today").lower()
+        # CLI fallback pro lokální běh
+        mode = os.getenv("MODE", "today")
         try:
             result = run_suggest(mode)
             try:

@@ -8,12 +8,12 @@ from sources_files import TipsportFixturesSource, FixturesSource, UnderstatSourc
 from tipsport_check import exists_on_tipsport
 
 # ------- Parametry -------
-MIN_ODDS = 1.5
+MIN_ODDS = 1.3
 MAX_ODDS = 2.9
 MAX_ALLOW = 10.0
-MIN_CONF_PRIMARY = 90       # hlavní práh
-MIN_CONF_FALLBACK = 85      # nouzový práh, když nic nesplní 90
-KICKOFF_WINDOW_H = 3        # jen zápasy, které začnou do 3 hodin
+MIN_CONF_PRIMARY = 85       # hlavní práh
+MIN_CONF_FALLBACK = 75      # nouzový práh, když nic nesplní 90
+KICKOFF_WINDOW_H = 8        # jen zápasy, které začnou do 3 hodin
 MAX_COUNT = 10              # vezmeme max. 10 tipů
 STAKE_BASE = 100            # modelová vsazená částka (Kč)
 

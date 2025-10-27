@@ -214,3 +214,24 @@ if __name__ == "__main__":
         port = int(os.getenv("PORT", "5000"))
         log.info(f"🌐 Flask start na portu {port} (webhook: /{SECRET_PATH})")
         app.run(host="0.0.0.0", port=port)
+from flask import Flask, request
+import telegram
+import os
+
+app = Flask(__name__)
+
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+SECRET_PATH = os.getenv("SECRET_PATH")
+PUBLIC_URL = os.getenv("PUBLIC_URL")
+
+bot = telegram.Bot(token=TOKEN)
+
+@app.route(f"/{SECRET_PATH}", methods=["POST"])
+def webhook():
+    update = telegram.Update.de_json(request.get_json(force=True), bot)
+    bot.dispatcher.process_update(update)
+    return "OK", 200
+
+@app.route("/healthz")
+def healthz():
+    return "OK", 200

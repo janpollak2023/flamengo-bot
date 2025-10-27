@@ -169,3 +169,40 @@ if __name__ == "__main__":
         port = int(os.getenv("PORT", "5000"))
         log.info(f"🌐 Flask start na portu {port} (webhook: /{SECRET_PATH})")
         app.run(host="0.0.0.0", port=port)
+# main.py (doplň import)
+from tip_engine import run_pipeline
+
+def _parse_kv(args):
+    out = {}
+    for a in args:
+        if "=" in a:
+            k,v = a.split("=",1)
+            out[k.lower()] = v
+    return out
+
+async def cmd_tip(update, ctx):
+    kv = _parse_kv(ctx.args)
+    sport   = kv.get("sport", "fotbal").lower()
+    minconf = int(kv.get("minconf", "85"))
+    window  = int(kv.get("window",  "8"))
+    count   = int(kv.get("count",   "10"))
+
+    await update.message.reply_text("🔎 Hledám zápasy… (analýza + kontrola Tipsport)")
+    tips = run_pipeline(sport=sport, minconf=minconf, window_h=window, max_count=count)
+
+    if not tips:
+        return await update.message.reply_text("ℹ️ Nic nad prahem důvěry. Zkus upravit parametry (např. minconf/window).")
+
+    lines = []
+    for t in tips:
+        # TipCandidate vs dict – ošetříme obě varianty
+        label = getattr(t, "market_label", None) or t.get("market_label", "")
+        conf  = getattr(t, "confidence", None) or t.get("confidence_pct", 0)
+        buck  = getattr(t, "bucket", None) or t.get("bucket", "")
+        reas  = getattr(t, "reason", None) or t.get("reason", "")
+        lines.append(f"🎯 {label} — {int(conf)}% [{buck}]\n• Důvod: {reas}")
+
+    await update.message.reply_text("\n\n".join(lines))
+
+# registrace
+application.add_handler(CommandHandler("tip", cmd_tip))

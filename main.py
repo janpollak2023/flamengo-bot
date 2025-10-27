@@ -1,81 +1,84 @@
-# main.py  — Flask 3 + python-telegram-bot 21.6 (webhook přes Flask)
+# main.py — Flask 3 + PTB v21, bez webhooku (long-polling)
 import os
-import asyncio
-from flask import Flask, request, jsonify, abort
+import threading
+import logging
+from flask import Flask, jsonify
 from telegram import Update
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ====== ENV ======
-PUBLIC_URL   = os.getenv("PUBLIC_URL", "").rstrip("/")
-SECRET_PATH  = os.getenv("SECRET_PATH", "webhook")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# ----- Logging -----
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("flamengo-bot")
 
-if not PUBLIC_URL or not TELEGRAM_TOKEN:
-    raise RuntimeError("Chybí PUBLIC_URL nebo TELEGRAM_TOKEN v env.")
+# ===== Telegram Application =====
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Missing TELEGRAM_TOKEN env var")
 
-# ====== Flask ======
-app = Flask(__name__)
+application = Application.builder().token(TOKEN).build()
 
-# ====== PTB Application ======
-application = Application.builder().token(TELEGRAM_TOKEN).build()
+# --- Handlery ---
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Ahoj! Jsem Flamengo bot.\n"
+        "Příkazy: /status, /tip"
+    )
 
-# --- Handlery (jednoduché) ---
-async def start_cmd(update, context):
-    await update.message.reply_text("Ahoj, jsem Kiki bot. Použij /tip nebo /status.")
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("✅ Žiju. Nasazený na Renderu, režim long-polling.")
 
-async def status_cmd(update, context):
-    await update.message.reply_text("✅ Bot běží (webhook).")
-
-# sem můžeš doplnit své funkce pro /tip, /tip24 atd.
-application.add_handler(CommandHandler("start", start_cmd))
-application.add_handler(CommandHandler("status", status_cmd))
-
-# ====== Inicializace PTB + webhook při startu procesu ======
-async def _startup():
-    # inici PTB (nepouštíme polling, jen příjem webhooků)
-    await application.initialize()
-    await application.start()
-
-    # nastav webhook (idempotentní – klidně opakovaně)
-    url = f"{PUBLIC_URL}/{SECRET_PATH}"
+# Tipy – voláme tvůj engine
+def _suggest_sync() -> str:
     try:
-        await application.bot.set_webhook(url=url, allowed_updates=["message"])
+        from tip_engine import suggest_today  # tvoje funkce
+        return suggest_today()
     except Exception as e:
-        # nechceme spadnout při deployi kvůli dočasné chybě
-        print(f"[WARN] set_webhook failed: {e}")
+        log.exception("tip_engine error")
+        return f"❌ Chyba v tip_engine: {e}"
 
-# spustíme hned při importu modulu (Flask 3 je WSGI – nevadí)
-asyncio.get_event_loop().run_until_complete(_startup())
+async def cmd_tip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # PTB handler je async; výpočet provedeme v thread poolu
+    loop = context.application.bot.loop
+    text = await loop.run_in_executor(None, _suggest_sync)
+    await update.message.reply_text(text or "Dnes nic silného nenašlo.")
 
-# ====== Routes ======
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CommandHandler("status", cmd_status))
+application.add_handler(CommandHandler("tip", cmd_tip))
+
+# ===== Flask app (sync) =====
+app = Flask(__name__)
+app.config["BOT_THREAD"] = None
+
 @app.get("/healthz")
 def healthz():
-    return "ok", 200
+    return jsonify(ok=True)
 
-@app.get("/status")
-def status_page():
-    return jsonify({"status": "live", "webhook": f"{PUBLIC_URL}/{SECRET_PATH}"}), 200
+# Volitelný rychlý náhled (není webhook)
+@app.get("/suggest")
+def suggest_http():
+    return _suggest_sync(), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
-# Telegram → náš webhook endpoint
-@app.post(f"/{SECRET_PATH}")
-async def telegram_webhook():
-    if request.headers.get("content-type", "").startswith("application/json"):
-        data = request.get_json(force=True, silent=True)
-        if not data:
-            abort(400)
-        update = Update.de_json(data, application.bot)
-        await application.process_update(update)
-        return "ok", 200
-    abort(415)
-
-# volitelné – ruční přenastavení webhooku (pro debug)
-@app.get("/setup")
-async def setup_webhook():
-    url = f"{PUBLIC_URL}/{SECRET_PATH}"
-    try:
-        asyncio.get_event_loop().run_until_complete(
-            application.bot.set_webhook(url=url, allowed_updates=["message"])
+# Spuštění PTB v samostatném vlákně (jen jednou na worker)
+def _start_bot_once():
+    if app.config["BOT_THREAD"] is None:
+        t = threading.Thread(
+            target=lambda: application.run_polling(
+                close_loop=False,
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES
+            ),
+            daemon=True,
+            name="ptb-polling",
         )
-        return jsonify({"set_webhook": url}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        t.start()
+        app.config["BOT_THREAD"] = t
+        log.info("PTB polling thread started.")
+
+# Při importu modulu ihned nastartuj bota (gunicorn worker)
+_start_bot_once()
+
+# Gunicorn entrypoint: "main:app"

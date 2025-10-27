@@ -206,3 +206,35 @@ async def cmd_tip(update, ctx):
 
 # registrace
 application.add_handler(CommandHandler("tip", cmd_tip))
+# v main.py
+from telegram.helpers import escape_markdown
+
+async def cmd_debug(update, ctx):
+    info = await application.bot.get_webhook_info()
+    mode = os.getenv("MODE","webhook").lower()
+    txt = (
+        f"*MODE:* {mode}\n"
+        f"*Webhook URL:* {info.url or '-'}\n"
+        f"*Has pending:* {info.has_custom_certificate}\n"
+        f"*IP:* {info.ip_address or '-'}\n"
+        f"*Max conn:* {info.max_connections}\n"
+        f"*Pending updates:* {info.pending_update_count}\n"
+    )
+    await update.message.reply_text(txt, parse_mode="Markdown")
+application.add_handler(CommandHandler("debug", cmd_debug))
+async def setup_webhook_async(app, public_url, secret_path):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)  # smaž zbytky pollingu
+    except Exception:
+        pass
+    url = f"{public_url.rstrip('/')}/{secret_path}"
+    await app.bot.set_webhook(url=url, allowed_updates=Update.ALL_TYPES)
+    return url
+
+if __name__ == "__main__":
+    if os.getenv("MODE","webhook").lower() == "polling":
+        application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    else:
+        if TOKEN and PUBLIC_URL:
+            asyncio.run(setup_webhook_async(application, PUBLIC_URL, SECRET_PATH))
+        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))

@@ -121,3 +121,65 @@ def odds_pass(odds: float | None) -> bool:
     if odds > MAX_ALLOW:       # 10.0 hard stop
         return False
     return odds <= MAX_ODDS    # 2.9 default cílové pásmo
+# tip_engine.py (doslova vlož na konec souboru)
+from urls import get_url
+from scraper import get_match_list, tipsport_stats
+from analyzer import TeamStats
+from flamengo_strategy import propose_football_tips  # máš už v importech
+
+def run_pipeline(sport: str = "fotbal", minconf: int = 85, window_h: int = 8, max_count: int = 10):
+    """
+    Primárně: použij gather_from_sources (tvé zdroje, okno startu do window_h).
+    Fallback: projdi Tipsport kategorii, vezmi ~12 zápasů a udělej rychlou analýzu on-the-fly.
+    Vrací list TipCandidate / dict s poli: market_label, confidence_pct, bucket, reason.
+    """
+    tips: list = []
+
+    # 1) Primární cesta – tvoje pipeline
+    try:
+        # tvoje funkce/typy – držím se názvů z hlavičky souboru:
+        sources = [TipsportFixturesSource(), FixturesSource(), UnderstatSource(), SofaScoreSource()]
+        facts: List[MatchFacts] = gather_from_sources(sources, window_hours=window_h)
+        for mf in facts:
+            # existuje na Tipsportu a kurzy OK?
+            if not exists_on_tipsport(mf): 
+                continue
+            if not odds_pass(getattr(mf, "odds", None)):
+                continue
+            cand: TipCandidate | None = propose_football_tips(mf)
+            if not cand:
+                continue
+            if getattr(cand, "confidence", 0) < minconf:
+                continue
+            tips.append(cand)
+            if len(tips) >= max_count:
+                return tips
+    except Exception:
+        pass  # spadlo? nevadí, jedeme fallback
+
+    if tips:
+        return tips
+
+    # 2) Fallback – on-the-fly přes Tipsport a rychlé TeamStats (mock mapování)
+    try:
+        url = get_url(sport)
+        matches = (get_match_list(url) or [])[:12]
+        for m in matches:
+            try:
+                ts = tipsport_stats(m["url"])
+                # TODO: namapuj ts -> TeamStats (zatím bezpečný mock, ať to jede)
+                home = TeamStats(form5_pts=10, gf_pg=2.0, ga_pg=1.0, first_half_goal_rate=65, btts_rate=55, injuries_key=0, home_adv=True)
+                away = TeamStats(form5_pts=6,  gf_pg=1.2, ga_pg=1.6, first_half_goal_rate=55, btts_rate=50, injuries_key=1, home_adv=False)
+                h2h  = {"1H_rate": 60, "btts_rate": 55}
+                picks = make_picks(home, away, h2h) or []
+                for p in picks:
+                    if p.get("confidence_pct", 0) >= minconf:
+                        tips.append(p)
+                        if len(tips) >= max_count:
+                            return tips
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return tips

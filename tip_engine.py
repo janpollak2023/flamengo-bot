@@ -112,3 +112,12 @@ def suggest_today() -> str:
         f"(výjimečně až do {MAX_ALLOW}). Vstup = zápasy dostupné na Tipsportu."
     )
     return header + "\n".join(lines) + "\n" + tail
+    # tip_engine.py
+def odds_pass(odds: float | None) -> bool:
+    if odds is None:
+        return True            # neznámý kurz nefiltruj
+    if odds < MIN_ODDS:        # 1.3 default
+        return False
+    if odds > MAX_ALLOW:       # 10.0 hard stop
+        return False
+    return odds <= MAX_ODDS    # 2.9 default cílové pásmo

@@ -1,80 +1,81 @@
+# main.py  — Flask 3 + python-telegram-bot 21.6 (webhook přes Flask)
 import os
 import asyncio
-from flask import Flask, request
+from flask import Flask, request, jsonify, abort
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler
 
+# ====== ENV ======
+PUBLIC_URL   = os.getenv("PUBLIC_URL", "").rstrip("/")
+SECRET_PATH  = os.getenv("SECRET_PATH", "webhook")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+if not PUBLIC_URL or not TELEGRAM_TOKEN:
+    raise RuntimeError("Chybí PUBLIC_URL nebo TELEGRAM_TOKEN v env.")
+
+# ====== Flask ======
 app = Flask(__name__)
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-SECRET_PATH = os.getenv("SECRET_PATH")
-PUBLIC_URL = os.getenv("PUBLIC_URL")
+# ====== PTB Application ======
+application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-if not TOKEN or not SECRET_PATH or not PUBLIC_URL:
-    raise RuntimeError("Missing env vars: TELEGRAM_TOKEN / SECRET_PATH / PUBLIC_URL")
+# --- Handlery (jednoduché) ---
+async def start_cmd(update, context):
+    await update.message.reply_text("Ahoj, jsem Kiki bot. Použij /tip nebo /status.")
 
-application = Application.builder().token(TOKEN).build()
+async def status_cmd(update, context):
+    await update.message.reply_text("✅ Bot běží (webhook).")
 
-# ----- Commands -----
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot běží! Flamengo systém aktivní.")
+# sem můžeš doplnit své funkce pro /tip, /tip24 atd.
+application.add_handler(CommandHandler("start", start_cmd))
+application.add_handler(CommandHandler("status", status_cmd))
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🟢 Status: ONLINE (Render live)")
-
-async def tip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎯 Generuji Flamengo tipy…")
-
-async def tip24(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📊 Tipy pro 24h – WIP.")
-
-async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🧩 Debug OK.")
-
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("status", status))
-application.add_handler(CommandHandler("tip", tip))
-application.add_handler(CommandHandler("tip24", tip24))
-application.add_handler(CommandHandler("debug", debug))
-
-# ----- Webhook init -----
-async def _startup(public_url: str, secret_path: str):
+# ====== Inicializace PTB + webhook při startu procesu ======
+async def _startup():
+    # inici PTB (nepouštíme polling, jen příjem webhooků)
     await application.initialize()
     await application.start()
-    url = f"{public_url.rstrip('/')}/{secret_path}"
-    await application.bot.set_webhook(url=url, allowed_updates=Update.ALL_TYPES)
-    print(f"✅ Webhook registered at: {url}")
 
-# Gunicorn neprovede __main__, proto registraci spustíme při prvním requestu (např. /healthz)
-_started = False
-@app.before_first_request
-def _ensure_webhook():
-    global _started
-    if _started:
-        return
-    _started = True
+    # nastav webhook (idempotentní – klidně opakovaně)
+    url = f"{PUBLIC_URL}/{SECRET_PATH}"
     try:
-        asyncio.run(_startup(PUBLIC_URL, SECRET_PATH))
+        await application.bot.set_webhook(url=url, allowed_updates=["message"])
     except Exception as e:
-        print("⚠️ Webhook init failed:", e)
+        # nechceme spadnout při deployi kvůli dočasné chybě
+        print(f"[WARN] set_webhook failed: {e}")
 
-# ----- Telegram webhook endpoint -----
-@app.post(f"/{SECRET_PATH}")
-def telegram_webhook():
-    try:
-        update = Update.de_json(request.get_json(force=True), application.bot)
-        asyncio.run(application.process_update(update))
-        return "OK", 200
-    except Exception as e:
-        print("⚠️ Webhook error:", e)
-        return "ERR", 500
+# spustíme hned při importu modulu (Flask 3 je WSGI – nevadí)
+asyncio.get_event_loop().run_until_complete(_startup())
 
-# ----- Health check -----
+# ====== Routes ======
 @app.get("/healthz")
 def healthz():
-    return "OK", 200
+    return "ok", 200
 
-# Lokální běh (ne Render)
-if __name__ == "__main__":
-    asyncio.run(_startup(PUBLIC_URL, SECRET_PATH))
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+@app.get("/status")
+def status_page():
+    return jsonify({"status": "live", "webhook": f"{PUBLIC_URL}/{SECRET_PATH}"}), 200
+
+# Telegram → náš webhook endpoint
+@app.post(f"/{SECRET_PATH}")
+async def telegram_webhook():
+    if request.headers.get("content-type", "").startswith("application/json"):
+        data = request.get_json(force=True, silent=True)
+        if not data:
+            abort(400)
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return "ok", 200
+    abort(415)
+
+# volitelné – ruční přenastavení webhooku (pro debug)
+@app.get("/setup")
+async def setup_webhook():
+    url = f"{PUBLIC_URL}/{SECRET_PATH}"
+    try:
+        asyncio.get_event_loop().run_until_complete(
+            application.bot.set_webhook(url=url, allowed_updates=["message"])
+        )
+        return jsonify({"set_webhook": url}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

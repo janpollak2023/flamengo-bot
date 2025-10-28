@@ -1,15 +1,17 @@
-# sources.py — rozšířený sken zápasů pro Flamengo /tip24
-# Autor: Kiki pro Honzu ❤️
-
+# sources.py — rozšířený sken (Eurofotbal + FootyStats)
+from __future__ import annotations
 import re
-import time
-import requests
-from datetime import datetime, timedelta, timezone
-from bs4 import BeautifulSoup
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-TZ = timezone(timedelta(hours=1))  # SEČ/CEST
+import requests
+from bs4 import BeautifulSoup
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+TIMEOUT = (7, 12)
+TZ = timezone(timedelta(hours=1))  # CET/CEST
 
 @dataclass
 class Tip:
@@ -23,159 +25,170 @@ class Tip:
     url: Optional[str] = None
     kickoff: Optional[datetime] = None
 
-
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/123.0.0.0 Safari/537.36"
-)
-
-TIMEOUT = (7, 12)
-
-
-# ==========================
-#   HELPERY
-# ==========================
-
 def _req(url: str) -> Optional[str]:
     try:
         r = requests.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT)
-        if r.status_code != 200 or "cf-chl" in r.text.lower():
+        if r.status_code != 200:
+            return None
+        # Cloudflare / blokace
+        if "cf-chl" in r.text.lower() or "attention required" in r.text.lower():
             return None
         return r.text
     except Exception:
         return None
 
-
-def _score_to_window(avg: float) -> str:
-    a = max(6, int(avg) - 8)
-    b = min(44, int(avg) + 8)
+# --- heuristiky pro skórování gólů do 1H ---
+def _win(avg_first_goal_min: float) -> str:
+    a = max(6, int(avg_first_goal_min) - 8)
+    b = min(44, int(avg_first_goal_min) + 8)
     return f"{a}’–{b}’"
 
+def _conf(rate: float, pace: float) -> int:
+    base = 60 + 30 * rate + 10 * (pace - 1.0)
+    return max(55, min(95, int(round(base))))
 
-def _conf(rate: float) -> int:
-    return max(70, min(95, int(rate * 100)))
-
-
-def _kickoff(hour: int, minute: int) -> datetime:
-    now = datetime.now(timezone.utc).astimezone(TZ)
-    ko = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if ko < now - timedelta(minutes=10):
-        ko += timedelta(days=1)
-    return ko
-
-
-# ==========================
-#   SCRAPERY
-# ==========================
-
-def eurofotbal_scan() -> List[Tip]:
+# ---------- EUROFOTBAL: dnešek + zítřek ----------
+def _eurofotbal_list(days: int = 2) -> List[Tip]:
     url = "https://www.eurofotbal.cz/zapasy/"
     html = _req(url)
-    tips: List[Tip] = []
+    out: List[Tip] = []
     if not html:
-        return tips
+        return out
 
     soup = BeautifulSoup(html, "html.parser")
-    blocks = soup.select("div#content div.match")
+    blocks = soup.select("div#content div.matches") or [soup]
+
     now = datetime.now(timezone.utc).astimezone(TZ)
+    today = now.date()
 
-    for b in blocks[:100]:
-        home = b.select_one(".team.home, .team-home")
-        away = b.select_one(".team.away, .team-away")
-        time_node = b.select_one(".time")
+    for blk in blocks:
+        # najdi hlavičku s datem (např. “Dnes”, “Zítra”, “Středa 29.10.”)
+        heading = blk.find(["h2", "h3"])
+        if heading:
+            head = heading.get_text(" ", strip=True).lower()
+        else:
+            head = ""
 
-        if not home or not away or not time_node:
-            continue
+        # rozhodni datum bloku
+        if "zítra" in head or "zitra" in head:
+            block_date = today + timedelta(days=1)
+        elif "dnes" in head:
+            block_date = today
+        else:
+            # zkus explicitní datum
+            m = re.search(r"(\d{1,2})\.\s*(\d{1,2})\.", head)
+            if m:
+                d, mth = int(m.group(1)), int(m.group(2))
+                block_date = datetime(now.year, mth, d, tzinfo=TZ).date()
+            else:
+                block_date = today  # fallback
 
-        h, a = home.get_text(strip=True), away.get_text(strip=True)
-        match = f"{h} – {a}"
+        if (block_date - today).days >= days:
+            continue  # jen dnes/zítra
 
-        tm = re.search(r"(\d{1,2}):(\d{2})", time_node.get_text())
-        ko = _kickoff(int(tm.group(1)), int(tm.group(2))) if tm else now
+        rows = blk.select("div.match")
+        for r in rows[:160]:
+            home = (r.select_one(".team.home") or r.select_one(".home") or r.select_one(".team-home"))
+            away = (r.select_one(".team.away") or r.select_one(".away") or r.select_one(".team-away"))
+            home = home.get_text(strip=True) if home else ""
+            away = away.get_text(strip=True) if away else ""
 
-        league = b.get("data-competition", "Fotbal")
-        tips.append(
-            Tip(
+            # soutěž
+            lg = (r.select_one(".competition") or r.select_one(".league") or r.select_one(".tournament"))
+            league = lg.get_text(" ", strip=True) if lg else "Fotbal"
+
+            # čas
+            ko = None
+            time_node = (r.select_one(".time") or r.select_one(".kickoff") or r.select_one(".score"))
+            if time_node:
+                tm = re.search(r"(\d{1,2}):(\d{2})", time_node.get_text(" ", strip=True))
+                if tm:
+                    hh, mm = int(tm.group(1)), int(tm.group(2))
+                    ko = datetime(block_date.year, block_date.month, block_date.day,
+                                  hh, mm, tzinfo=TZ)
+
+            if not home or not away:
+                continue
+
+            match = f"{home} – {away}"
+            out.append(Tip(
                 match=match,
                 league=league,
                 market="Gól v 1. poločase: ANO (Over 0.5 HT)",
-                confidence=85,
-                window=_score_to_window(21),
-                reason="Eurofotbal.cz – ligový zápas, očekávané brzké góly.",
+                confidence=_conf(0.74, 1.10),
+                window=_win(20),
+                reason="Eurofotbal (program) – vhodný profil na brzký gól.",
                 odds=None,
-                url=url,
+                url="https://www.eurofotbal.cz/zapasy/",
                 kickoff=ko,
-            )
-        )
+            ))
 
-    return tips
+    return out
 
-
-def footystats_scan() -> List[Tip]:
+# ---------- FOOTYSTATS: zítřek (tomorrow) ----------
+def _footystats_tomorrow() -> List[Tip]:
     url = "https://footystats.org/cz/tomorrow/"
     html = _req(url)
-    tips: List[Tip] = []
+    out: List[Tip] = []
     if not html:
-        return tips
+        return out
 
     soup = BeautifulSoup(html, "html.parser")
     rows = soup.select("table tr") or soup.select(".match-row")
+    now = datetime.now(timezone.utc).astimezone(TZ)
 
-    for r in rows[:80]:
-        text = r.get_text(" ", strip=True)
+    for row in rows[:160]:
+        text = row.get_text(" ", strip=True)
         if " - " not in text:
             continue
-        m = re.search(r"([^\n-]+?)\s*-\s*([^\n]+)", text)
+        m = re.search(r"(.+?)\s*-\s*(.+)", text)
         if not m:
             continue
-        home, away = m.group(1).strip(), m.group(2).strip()
-        match = f"{home} – {away}"
+        home = m.group(1).strip()
+        away = m.group(2).strip()
 
         tm = re.search(r"(\d{1,2}):(\d{2})", text)
-        ko = _kickoff(int(tm.group(1)), int(tm.group(2))) if tm else None
+        if tm:
+            hh, mm = int(tm.group(1)), int(tm.group(2))
+        else:
+            hh, mm = 18, 0  # default
 
-        tips.append(
-            Tip(
-                match=match,
-                league="FootyStats",
-                market="Gól v 1. poločase: ANO (Over 0.5 HT)",
-                confidence=83,
-                window=_score_to_window(20),
-                reason="FootyStats.org – statisticky gólové týmy v 1H.",
-                odds=None,
-                url=url,
-                kickoff=ko,
-            )
-        )
+        # zítra
+        z = (now + timedelta(days=1)).date()
+        ko = datetime(z.year, z.month, z.day, hh, mm, tzinfo=TZ)
 
-    return tips
+        out.append(Tip(
+            match=f"{home} – {away}",
+            league="FootyStats",
+            market="Gól v 1. poločase: ANO (Over 0.5 HT)",
+            confidence=_conf(0.76, 1.15),
+            window=_win(19),
+            reason="FootyStats (tomorrow) – datový výběr na rychlý gól.",
+            odds=None,
+            url=url,
+            kickoff=ko,
+        ))
+    return out
 
-
-# ==========================
-#   HLAVNÍ FUNKCE
-# ==========================
-
+# ---------- PUBLIC ----------
 def analyze_sources(limit: int = 5) -> List[Tip]:
-    """
-    Získá seznam zápasů z různých webů a spojí je.
-    """
-    all_tips: List[Tip] = []
-
+    tips: List[Tip] = []
     try:
-        ef = eurofotbal_scan()
-        all_tips.extend(ef)
+        tips.extend(_eurofotbal_list(days=2))   # dnes + zítra
+    except Exception:
+        pass
+    try:
+        tips.extend(_footystats_tomorrow())     # zítřek (datový doplněk)
     except Exception:
         pass
 
-    time.sleep(0.3)
+    # deduplikace + seřazení (dřívější výkop, vyšší confidence)
+    uniq = {}
+    for t in tips:
+        key = (t.match.lower(), t.kickoff.isoformat() if t.kickoff else "")
+        if key not in uniq:
+            uniq[key] = t
 
-    try:
-        fs = footystats_scan()
-        all_tips.extend(fs)
-    except Exception:
-        pass
-
-    # seřadit podle confidence
-    all_tips.sort(key=lambda t: (-t.confidence, t.kickoff or datetime.max))
-    return all_tips[:limit]
+    tips = list(uniq.values())
+    tips.sort(key=lambda t: (t.kickoff.timestamp() if t.kickoff else 9e15, -t.confidence))
+    return tips[:max(1, limit)]

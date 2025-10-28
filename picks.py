@@ -1,189 +1,169 @@
-# picks.py — Gól v 1. poločase (fotbal), filtrováno na aktuální čas v ČR
+# main.py – Kiki Tipy 2 (Flamengo bot)
+# ✅ Webhook, Telegram odpovědi a analýza "Gól do poločasu"
+# Autor: Kiki pro Honzu ❤️
 
-from dataclasses import dataclass
-from typing import List, Optional
-import re
-from datetime import datetime, timedelta
-import requests
-from bs4 import BeautifulSoup
-from zoneinfo import ZoneInfo
-import random
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8"
-}
-
-TIPSPORT_FOOTBALL = "https://m.tipsport.cz/kurzy/fotbal-16"
-TZ = ZoneInfo("Europe/Prague")     # pevně ČR
-
-@dataclass
-class Tip:
-    match: str
-    league: str
-    market: str
-    odds: Optional[float]
-    confidence: int
-    window: str
-    reason: str
-    url: Optional[str]
-    kickoff: Optional[datetime] = None  # NOVĚ: výkop
-
-def _get_html(url: str) -> Optional[str]:
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=8)
-        if r.status_code == 200 and r.text:
-            return r.text
-    except Exception:
-        pass
-    return None
-
-_name_separators = [" - ", " – ", " v ", " vs ", " vs. "]
-
-def _normalize_match(txt: str) -> Optional[str]:
-    """Zkus spolehlivě najít 'Tým A – Tým B' i když je DOM rozbitý."""
-    txt = re.sub(r"\s+", " ", txt).strip()
-    for sep in _name_separators:
-        if sep in txt:
-            left, right = txt.split(sep, 1)
-            left = left.strip(" -–·|")
-            right = right.strip(" -–·|")
-            if left and right:
-                return f"{left} – {right}"
-    # fallback: když najdeme alespoň dvě slova s velkým písmenem
-    parts = re.findall(r"[A-ZÁČĎÉĚÍĹĽŇÓÔŘŠŤÚŮÝŽ][\w\.\- ]{2,}", txt)
-    if len(parts) >= 2:
-        return f"{parts[0].strip()} – {parts[1].strip()}"
-    return None
-
-_dt_pat = re.compile(
-    r"(?P<d>\d{1,2})\.\s*(?P<m>\d{1,2})\.\s*(?P<y>\d{4})?.*?(?P<h>\d{1,2}):(?P<min>\d{2})"
+import os
+from datetime import datetime
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
-def _extract_kickoff(block_text: str) -> Optional[datetime]:
-    """
-    Hledá formát typu '2. 11. 2025 (ne) 17:00' nebo '3. 11. (po) 19:00'.
-    Vrací čas v Europe/Prague.
-    """
-    t = _dt_pat.search(block_text)
-    if not t:
-        # někdy je tam jen '17:00' → vezmeme dnešek
-        only_time = re.search(r"\b(?P<h>\d{1,2}):(?P<m>\d{2})\b", block_text)
-        if only_time:
-            now = datetime.now(TZ)
-            h = int(only_time.group("h"))
-            m = int(only_time.group("m"))
-            dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if dt < now:
-                dt += timedelta(days=1)
-            return dt
-        return None
-    d = int(t.group("d"))
-    m = int(t.group("m"))
-    y = int(t.group("y")) if t.group("y") else datetime.now(TZ).year
-    h = int(t.group("h"))
-    mn = int(t.group("min"))
-    try:
-        return datetime(y, m, d, h, mn, tzinfo=TZ)
-    except Exception:
-        return None
+from picks import find_first_half_goal_candidates  # rychlý modul (/tip)
+from sources import analyze_sources                 # širší sken (/tip24)
 
-def _parse_tipsport_list(html: str) -> List[Tip]:
-    soup = BeautifulSoup(html, "lxml")
-    tips: List[Tip] = []
+# ======================
+#   ENVIRONMENT
+# ======================
+TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+SECRET_PATH = os.getenv("SECRET_PATH", "/tvuj_tajny_hook").strip()
+if not SECRET_PATH.startswith("/"):
+    SECRET_PATH = "/" + SECRET_PATH
+SECRET_TOKEN = os.getenv("TELEGRAM_SECRET", "").strip()
+PORT = int(os.getenv("PORT", "10000"))
 
-    # Hledáme kotvy na zápasy a zároveň si bereme okolní text kvůli času
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/kurzy/zapas/" not in href:
-            continue
+# ======================
+#   HELPERS
+# ======================
 
-        # text odkazu (někdy jen polovina názvu), zkusíme vzít i okolí
-        raw = a.get_text(" ", strip=True)
-        block_text = a.find_parent().get_text(" ", strip=True) if a.find_parent() else raw
-        match_name = _normalize_match(block_text) or _normalize_match(raw)
-        if not match_name:
-            continue
+def _fmt_ko(dt: datetime | None) -> str:
+    """Výkop v lokálním čase zařízení (CZ ok)."""
+    return dt.astimezone(tz=None).strftime("%d.%m. %H:%M") if dt else "neznámé"
 
-        kickoff = _extract_kickoff(block_text)
-        league = "Fotbal"
-        url = "https://m.tipsport.cz" + href
+# ======================
+#   COMMAND HANDLERY
+# ======================
 
-        # confidence jemně doladíme podle blízkosti startu
-        base = 86
-        if kickoff:
-            mins_to = int((kickoff - datetime.now(TZ)).total_seconds() // 60)
-            if mins_to < 0:
-                continue  # už začalo → přeskočit
-            if mins_to <= 120:
-                base += 3
-            elif mins_to <= 300:
-                base += 1
-        base = max(80, min(92, base + random.randint(-2, 2)))
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Základní uvítací zpráva"""
+    await update.message.reply_html(
+        "Ahoj Honzo! 🟢 Jedu.\n"
+        "/status = kontrola\n"
+        "/tip = vyhledávání zápasů (gól do poločasu)\n"
+        "/tip24 = širší sken (více zdrojů)\n"
+        "/debug = diagnostika zdrojů\n\n"
+        "🔥 Bot je připravený na Flamengo strategii."
+    )
 
-        tips.append(Tip(
-            match=match_name,
-            league=league,
-            market="Gól v 1. poločase: ANO (Over 0.5 HT)",
-            odds=None,
-            confidence=base,
-            window=random.choice(["12’–28’", "14’–33’", "16’–34’"]),
-            reason="Rychlý výběr z karty (Flamengo-light filtr).",
-            url=url,
-            kickoff=kickoff
-        ))
-        if len(tips) >= 16:
-            break
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Vrací stav bota"""
+    await update.message.reply_text("✅ Alive – webhook OK, bot běží.")
 
-    # Filtrování: jen dnešek + nejbližších 7 dní, nic co už začalo
-    now = datetime.now(TZ)
-    week = now + timedelta(days=7)
-    filtered: List[Tip] = []
-    for t in tips:
-        if t.kickoff is None:
-            # pokud čas nevíme, necháme projít, ale dáme dolů v řazení
-            filtered.append(t)
-        else:
-            if now <= t.kickoff <= week:
-                filtered.append(t)
-
-    # řazení: nejdřív podle času, pak confidence
-    def _sort_key(t: Tip):
-        ko = t.kickoff if t.kickoff else now + timedelta(days=8)
-        return (ko, -t.confidence, t.match)
-
-    filtered.sort(key=_sort_key)
-    return filtered
-
-def find_first_half_goal_candidates(limit: int = 3) -> List[Tip]:
-    html = _get_html(TIPSPORT_FOOTBALL)
-    tips: List[Tip] = []
-    if html:
-        try:
-            tips = _parse_tipsport_list(html)
-        except Exception:
-            tips = []
+async def tip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Najde zápasy podle Flamengo logiky – Gól v 1. poločase (rychlé TOP 3)"""
+    tips = find_first_half_goal_candidates(limit=3)
 
     if not tips:
-        # Fallback – ať bot vždy odpoví
-        now = datetime.now(TZ)
-        tips = [
-            Tip("Midtjylland – AGF Aarhus", "Dánsko",
-                "Gól v 1. poločase: ANO (Over 0.5 HT)",
-                1.25, 90, "14’–33’",
-                "Fallback: stabilně gólové 1H, domácí favorit.", None,
-                kickoff=now + timedelta(days=6, hours=7)),
-            Tip("Genk – Standard", "Belgie",
-                "Gól v 1. poločase: ANO (Over 0.5 HT)",
-                1.40, 88, "16’–34’",
-                "Fallback: oba inkasují brzy, tempo ligy.", None,
-                kickoff=now + timedelta(days=5, hours=5)),
-            Tip("Rapid Wien – Sturm Graz", "Rakousko",
-                "Gól v 1. poločase: ANO (Over 0.5 HT)",
-                1.29, 86, "12’–28’",
-                "Fallback: útočné vstupy do zápasů.", None,
-                kickoff=now + timedelta(days=4, hours=5)),
-        ]
+        await update.message.reply_text("⚠️ Momentálně žádné zápasy nenalezeny.")
+        return
 
-    return tips[:limit]
+    lines = []
+    for i, t in enumerate(tips, 1):
+        link = f"\n🔗 {t.url}" if getattr(t, "url", None) else ""
+        kurz = f" @ {t.odds:.2f}" if getattr(t, "odds", None) else ""
+        ko = f"🕒 {_fmt_ko(getattr(t, 'kickoff', None))}"
+        lines.append(
+            f"#{i} ⚽ <b>{t.match}</b> ({t.league}) — {ko}\n"
+            f"   Sázka: <b>{t.market}{kurz}</b>\n"
+            f"   Důvěra: <b>{t.confidence}%</b> | Okno: <b>{t.window}</b>\n"
+            f"   Důvod: {t.reason}{link}"
+        )
+
+    msg = (
+        "🔥 <b>Flamengo – Gól do poločasu (TOP kandidáti)</b>\n"
+        + "\n\n".join(lines)
+        + "\n\n"
+        "Pozn.: Pokud Tipsport blokuje přístup, bot vrátí fallback návrhy.\n"
+        "V další verzi přidáme přesné kurzy a statistiky z detailů zápasů. ⚙️"
+    )
+    await update.message.reply_html(msg)
+
+async def tip24_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Širší sken z více zdrojů (TOP 5). /tip zůstává beze změny."""
+    tips = analyze_sources(limit=5)
+
+    # fallback – kdyby externí zdroje nic nevrátily
+    if not tips:
+        tips = find_first_half_goal_candidates(limit=5)
+        if not tips:
+            await update.message.reply_text("⚠️ Teď nic kvalitního nenašlo ani rozšířené skenování.")
+            return
+
+    lines = []
+    for i, t in enumerate(tips, 1):
+        ko = f"🕒 {_fmt_ko(getattr(t, 'kickoff', None))}"
+        link = f"\n🔗 {t.url}" if getattr(t, "url", None) else ""
+        lines.append(
+            f"#{i} ⚽ <b>{t.match}</b> — {ko}\n"
+            f"   <b>{t.market}</b>\n"
+            f"   Důvěra: <b>{t.confidence}%</b> | Okno: <b>{t.window}</b>\n"
+            f"   {t.reason}{link}"
+        )
+
+    await update.message.reply_html(
+        "🔍 <b>Flamengo /tip24 – rozšířený sken (TOP 5)</b>\n\n" + "\n\n".join(lines)
+    )
+
+# --- DEBUG: ukáže, kolik tipů vrátily reálné zdroje vs. fallback ---
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        src = analyze_sources(limit=8) or []
+    except Exception as e:
+        src = []
+    try:
+        fast = find_first_half_goal_candidates(limit=8) or []
+    except Exception as e:
+        fast = []
+
+    now = datetime.now().astimezone().strftime("%d.%m. %H:%M %Z")
+    msg = (
+        "🛠 DEBUG\n"
+        f"- sources.py (rozšířené zdroje): {len(src)} tipů\n"
+        f"- picks.py (rychlý sken/Tipsport): {len(fast)} tipů\n"
+        f"- Now: {now}\n"
+        "Pozn.: Pokud sources=0, běží fallback → proto se opakují stejné páry."
+    )
+    await update.message.reply_text(msg)
+
+async def echo_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback pro běžné zprávy"""
+    if update.message and update.message.text:
+        await update.message.reply_text("Tip modul připraven – napojíme gól do poločasu.")
+
+# ======================
+#   APLIKACE
+# ======================
+
+def build_app() -> Application:
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("tip", tip_cmd))
+    app.add_handler(CommandHandler("tip24", tip24_cmd))
+    app.add_handler(CommandHandler("debug", debug_cmd))  # ✅ přidáno
+    app.add_handler(MessageHandler(filters.ALL, echo_all))
+    return app
+
+# ======================
+#   MAIN
+# ======================
+
+def main():
+    app = build_app()
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=SECRET_PATH.lstrip("/"),
+        webhook_url=f"{PUBLIC_URL}{SECRET_PATH}",
+        secret_token=SECRET_TOKEN if SECRET_TOKEN else None,
+        allowed_updates=["message", "edited_message", "callback_query"],
+        drop_pending_updates=True,
+    )
+
+if __name__ == "__main__":
+    main()

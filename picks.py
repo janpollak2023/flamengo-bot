@@ -1,5 +1,5 @@
 # picks.py — rychlý výběr kandidátů "Gól v 1. poločase"
-# Autor: Kiki pro Honzu ❤️  — verze: ef+ls v2 (podpora hours_window)
+# Autor: Kiki pro Honzu ❤️  — verze: ef+ls v3 (ligové přepínače + poháry + hours_window)
 
 from __future__ import annotations
 import os, re, time, random
@@ -17,13 +17,18 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 TZ = timezone(timedelta(hours=1))                       # CET/CEST
 ALLOW_FALLBACK = os.getenv("ALLOW_FALLBACK", "1") == "1"
+STRICT_LEAGUES = os.getenv("STRICT_LEAGUES", "1") == "1"  # ✅ NOVÉ: 0 = nefiltruj ligy
 TIMEOUT = (7, 14)
 
 PREFERRED_LEAGUES = {s.strip().lower() for s in os.getenv(
     "PREFERRED_LEAGUES",
+    # Ligy + POHÁRY (často padaly mimo filtr → rozšířeno)
     "czech, cesko, fortuna, denmark, danish, superliga, belgium, jupiler, austria, bundesliga, "
     "germany, netherlands, eredivisie, scotland, sweden, norway, poland, turkey, portugal, spain, "
-    "england, premier, italy, serie, france, ligue"
+    "england, premier, italy, serie, france, ligue, "
+    "cup, pohar, pohár, fa cup, dfb, dfb-pokal, coppa, coppa italia, copa, copa del rey, "
+    "taca, taça, beker, knvb, knvb beker, tff, super cup, supercupa, superpuchar, pokal, "
+    "rakousky pohar, cesky pohar, slovensky pohar"
 ).split(",")}
 
 # =============== MODEL ===============
@@ -57,6 +62,9 @@ def _session() -> requests.Session:
     return s
 
 def _within_preferred(league_text: str) -> bool:
+    """Pokud STRICT_LEAGUES=0 → propusť vše. Jinak filtruj podle PREFERRED_LEAGUES."""
+    if not STRICT_LEAGUES:
+        return True
     low = (league_text or "").lower()
     return any(k in low for k in PREFERRED_LEAGUES)
 

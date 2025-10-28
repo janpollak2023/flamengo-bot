@@ -48,22 +48,27 @@ def healthz():
 
 @app.post(SECRET_PATH)
 def telegram_webhook():
-    # LOGUJEME KAŽDÝ ZÁSAH WEBHOOKU
     log.info("WEBHOOK HIT %s headers=%s", SECRET_PATH, dict(request.headers))
     if SECRET_TOKEN and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != SECRET_TOKEN:
         log.warning("WEBHOOK 403 – secret token mismatch")
         return "forbidden", 403
+
     data = request.get_json(silent=True, force=True)
     if not data:
         log.warning("WEBHOOK 400 – no json")
         return "no json", 400
+
     try:
         update = Update.de_json(data, application.bot)
-        application.update_queue.put_nowait(update)
-        log.info("WEBHOOK OK – update queued (id=%s)", update.update_id)
+
+        # ⬇️ KLÍČOVÁ ZMĚNA: zpracujeme update okamžitě
+        # (bez fronty), aby při restartech/latenci nic "nepropadlo".
+        application.create_task(application.process_update(update))
+        log.info("WEBHOOK OK – update processed (id=%s)", update.update_id)
         return "ok", 200
+
     except Exception as e:
-        log.exception("WEBHOOK 500 – failed to enqueue update: %s", e)
+        log.exception("WEBHOOK 500 – failed to process update: %s", e)
         return "error", 500
 
 # --- PTB START NA POZADÍ ---

@@ -1,148 +1,66 @@
-# main.py — Flask + python-telegram-bot 21.6 (Render webhook, 1 worker)
-# ✅ plně funkční verze
+# main.py — MINIMAL PTB WEBHOOK (bez Flasku, ověřeno s python-telegram-bot==21.6)
 
 import os
-import threading
-import asyncio
-import logging
-from flask import Flask, request
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
-from telegram.error import TelegramError
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ---------- LOGGING ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("flamengo-bot")
-
-# ---------- ENV ----------
 TOKEN        = os.getenv("TELEGRAM_TOKEN", "")
 PUBLIC_URL   = os.getenv("PUBLIC_URL", "").rstrip("/")
 SECRET_PATH  = os.getenv("SECRET_PATH", "/webhook")
 if not SECRET_PATH.startswith("/"):
     SECRET_PATH = "/" + SECRET_PATH
 SECRET_TOKEN = os.getenv("TELEGRAM_SECRET", "")
+PORT         = int(os.getenv("PORT", "10000"))
 
-# ---------- TELEGRAM ----------
-application: Application = Application.builder().token(TOKEN).build()
-
-async def cmd_start(update: Update, _):
+# --- Handlery ---
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Ahoj Honzíku! 🟢 Jedu.\n/status = kontrola\n/tip = připraveno (napojíme scraper).",
+        "Ahoj Honzíku! 🟢 Jedu.\n/status = kontrola\n/tip = připraveno.",
         parse_mode=ParseMode.HTML
     )
 
-async def cmd_status(update: Update, _):
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Alive – webhook OK, bot běží.")
 
-async def cmd_tip(update: Update, _):
-    await update.message.reply_text("Tip modul připraven – brzy nasadíme analýzu gólů do poločasu.")
+async def tip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Tip modul připraven – napojíme gól do poločasu.")
 
-async def echo_all(update: Update, _):
+async def echo_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.text:
         await update.message.reply_text(f"Echo: {update.message.text[:120]}")
 
-# ---------- HANDLERY ----------
-application.add_handler(CommandHandler("start",  cmd_start))
-application.add_handler(CommandHandler("status", cmd_status))
-application.add_handler(CommandHandler("tip",    cmd_tip))
-application.add_handler(MessageHandler(filters.ALL, echo_all))
+async def main():
+    app = Application.builder().token(TOKEN).build()
 
-# ---------- ERROR HANDLER ----------
-async def on_error(update, context):
-    log.exception("HANDLER ERROR: %s", context.error)
+    app.add_handler(CommandHandler("start",  start_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("tip",    tip_cmd))
+    app.add_handler(MessageHandler(filters.ALL, echo_all))
 
-application.add_error_handler(on_error)
-
-# ---------- FLASK ----------
-app = Flask(__name__)
-
-@app.get("/healthz")
-def healthz():
-    return "OK", 200
-
-# PTB event loop reference (pro přímé volání z Flasku)
-PTB_LOOP: asyncio.AbstractEventLoop | None = None
-
-@app.post(SECRET_PATH)
-def telegram_webhook():
-    log.info("WEBHOOK HIT %s", SECRET_PATH)
-
-    # Ověření tajného tokenu
-    if SECRET_TOKEN and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != SECRET_TOKEN:
-        log.warning("WEBHOOK 403 – secret token mismatch")
-        return "forbidden", 403
-
-    data = request.get_json(silent=True, force=True)
-    if not data:
-        log.warning("WEBHOOK 400 – no json")
-        return "no json", 400
-
+    # PTB spustí vlastní web server a sám nastaví webhook
+    webhook_url = f"{PUBLIC_URL}{SECRET_PATH}"
+    await app.initialize()
     try:
-        update = Update.de_json(data, application.bot)
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+    await app.bot.set_webhook(
+        url=webhook_url,
+        secret_token=SECRET_TOKEN if SECRET_TOKEN else None,
+        allowed_updates=["message","edited_message","callback_query"]
+    )
+    await app.start()
+    # Vestavěný HTTP server PTB
+    await app.updater.start_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=SECRET_PATH.lstrip("/"),
+        secret_token=SECRET_TOKEN if SECRET_TOKEN else None,
+    )
+    # běž navždy
+    await app.updater.wait_until_closed()
 
-        # ✅ Správný způsob – pošli update do běžícího PTB loopu
-        if PTB_LOOP and PTB_LOOP.is_running():
-            fut = asyncio.run_coroutine_threadsafe(application.process_update(update), PTB_LOOP)
-            try:
-                fut.result(timeout=0.05)
-            except Exception:
-                pass
-            log.info("WEBHOOK OK – update processed (id=%s)", update.update_id)
-            return "ok", 200
-        else:
-            log.error("WEBHOOK 500 – PTB loop not running")
-            return "error", 500
-
-    except Exception as e:
-        log.exception("WEBHOOK 500 – failed to process update: %s", e)
-        return "error", 500
-
-
-# ---------- PTB START NA POZADÍ ----------
-_started = False
-
-def _run_ptb_loop():
-    global PTB_LOOP
-    loop = asyncio.new_event_loop()
-    PTB_LOOP = loop
-    asyncio.set_event_loop(loop)
-
-    async def boot():
-        log.info("PTB initialize()…")
-        await application.initialize()
-        try:
-            await application.bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            pass
-
-        if PUBLIC_URL and SECRET_PATH:
-            url = f"{PUBLIC_URL}{SECRET_PATH}"
-            log.info("Setting webhook to %s", url)
-            await application.bot.set_webhook(
-                url=url,
-                secret_token=SECRET_TOKEN if SECRET_TOKEN else None,
-                allowed_updates=["message", "edited_message", "callback_query"]
-            )
-
-        log.info("PTB start()…")
-        await application.start()
-        log.info("PTB started.")
-
-    loop.run_until_complete(boot())
-    loop.run_forever()
-
-
-def _ensure_started():
-    global _started
-    if not _started:
-        t = threading.Thread(target=_run_ptb_loop, name="ptb-thread", daemon=True)
-        t.start()
-        _started = True
-        log.info("PTB thread spawned.")
-
-_ensure_started()
-
-# ---------- GUNICORN ----------
-# Start command (Render):
-# gunicorn -w 1 -k gthread -b 0.0.0.0:$PORT main:app
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())

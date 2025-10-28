@@ -5,7 +5,7 @@
 import os
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple, List
 
 from telegram import Update
 from telegram.ext import (
@@ -47,31 +47,50 @@ def _fmt_ko(dt: Optional[datetime]) -> str:
     """Výkop v lokálním čase zařízení (CZ ok)."""
     return dt.astimezone(tz=None).strftime("%d.%m. %H:%M") if dt else "neznámé"
 
-def _hours_from_arg(arg: Optional[str]) -> int:
+def _parse_tip_window(arg: Optional[str]) -> Tuple[datetime, datetime, str]:
     """
-    Povolené varianty:
-      - None  -> 24
-      - 'dnes' -> do půlnoci (min 1 h, max 24 h)
-      - 'zitra' -> zítra (24 h okno od zítřejší půlnoci)
-      - integer string -> daný počet hodin (1..72)
+    Vrátí (start, end, popis) časového okna pro filtrování tipů.
+    Podporuje:
+      /tip           -> teď .. +24 h
+      /tip 6         -> teď .. +6 h
+      /tip dnes      -> teď .. dnešní půlnoc
+      /tip zitra     -> zítřek 00:00 .. zítřek 23:59
     """
-    if not arg:
-        return 24
-    a = arg.strip().lower()
     now = datetime.now().astimezone()
+    label = "24 h"
+    if not arg:
+        return now, now + timedelta(hours=24), label
+
+    a = arg.strip().lower()
     if a in ("dnes", "today"):
-        # do půlnoci místního času
         midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        hours = int(max(1, min(72, (midnight - now).total_seconds() // 3600 or 1)))
-        return hours
+        label = "dnes"
+        return now, midnight, label
+
     if a in ("zítra", "zitra", "tomorrow"):
-        # zítra 00:00 až 23:59 -> 24 h od zítřejší půlnoci
-        return 24
+        start = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        label = "zítra"
+        return start, end, label
+
     try:
-        n = int(a)
-        return max(1, min(72, n))
+        hours = max(1, min(72, int(a)))
+        label = f"{hours} h"
+        return now, now + timedelta(hours=hours), label
     except Exception:
-        return 24
+        return now, now + timedelta(hours=24), "24 h"
+
+def _filter_by_window(tips: List, start: datetime, end: datetime) -> List:
+    out = []
+    for t in tips:
+        ko = getattr(t, "kickoff", None)
+        if ko is None:
+            # když neznáme výkop, ponecháme (ať máme z čeho vybírat)
+            out.append(t)
+            continue
+        if start <= ko.astimezone(start.tzinfo) < end:
+            out.append(t)
+    return out
 
 # ======================
 #   COMMAND HANDLERY
@@ -98,17 +117,20 @@ async def tip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Najde zápasy podle Flamengo logiky – Gól v 1. poločase (rychlé TOP 3).
     Podporuje /tip <hodiny> | /tip dnes | /tip zitra
     """
-    hours = _hours_from_arg(context.args[0]) if context.args else 24
+    # 1) časové okno z argumentu
+    start, end, label = _parse_tip_window(context.args[0] if context.args else None)
 
-    # Pokud uživatel píše "zitra", posuneme počátek okna na zítřejší půlnoc.
-    # Funkce v picks.py pracuje s oknem "teď .. teď+hours", takže pro "zítra"
-    # mu pošleme okno 24 hodin, ale tips modul si to drží relativně – proto
-    # zde jen informativně ponecháme hours=24; výběr už zúží naše pravidla času.
-    tips = find_first_half_goal_candidates(limit=3, hours_window=hours)
+    # 2) vezmeme širší set kandidátů a pak ho ořízneme na časové okno
+    #    (picks.py vrací už seřazené podle confidence a času).
+    base = find_first_half_goal_candidates(limit=16) or []
+    tips = _filter_by_window(base, start, end)
 
     if not tips:
-        await update.message.reply_text("⚠️ Teď nic vhodného v tom okně.")
+        await update.message.reply_text(f"⚠️ V okně „{label}“ jsem nic vhodného nenašla.")
         return
+
+    # finální TOP 3 po filtrování
+    tips = tips[:3]
 
     lines = []
     for i, t in enumerate(tips, 1):
@@ -122,7 +144,10 @@ async def tip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   Důvod: {t.reason}{link}"
         )
 
-    msg = "🔥 <b>Flamengo – Gól do poločasu (TOP kandidáti)</b>\n" + "\n\n".join(lines)
+    msg = (
+        "🔥 <b>Flamengo – Gól do poločasu (TOP kandidáti)</b>\n"
+        + "\n\n".join(lines)
+    )
     await update.message.reply_html(msg)
 
 async def tip24_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -135,7 +160,7 @@ async def tip24_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # fallback – kdyby externí zdroje nic nevrátily
     if not tips:
-        tips = find_first_half_goal_candidates(limit=5)
+        tips = find_first_half_goal_candidates(limit=8)
         if not tips:
             await update.message.reply_text("⚠️ Teď nic kvalitního nenašlo ani rozšířené skenování.")
             return
@@ -163,7 +188,7 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("sources failed in debug: %s", e)
         src = []
     try:
-        fast = find_first_half_goal_candidates(limit=8) or []
+        fast = find_first_half_goal_candidates(limit=12) or []
     except Exception as e:
         log.exception("picks failed in debug: %s", e)
         fast = []

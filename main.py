@@ -1,7 +1,6 @@
-# main.py – Telegram bot Kiki Tipy 2
-# ✅ Webhook + /start + /status + /tip (vyhledávání z picks.py)
-# Start Command (Render): python main.py
-# Build Command: pip install -r requirements.txt
+# main.py – Kiki Tipy 2 (Flamengo bot)
+# ✅ Webhook, Telegram odpovědi a analýza "Gól do poločasu"
+# Autor: Kiki pro Honzu ❤️
 
 import os
 from telegram import Update
@@ -13,35 +12,38 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from picks import find_first_half_goal_candidates   # importujeme náš modul na tipy
+from picks import find_first_half_goal_candidates  # náš nový modul
 
 # ======================
 #   ENVIRONMENT
 # ======================
-TOKEN        = os.getenv("TELEGRAM_TOKEN", "").strip()
-PUBLIC_URL   = os.getenv("PUBLIC_URL", "").rstrip("/")  # např. https://flamengo-bot.onrender.com
-SECRET_PATH  = os.getenv("SECRET_PATH", "/tvuj_tajny_hook").strip()
+TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+SECRET_PATH = os.getenv("SECRET_PATH", "/tvuj_tajny_hook").strip()
 if not SECRET_PATH.startswith("/"):
     SECRET_PATH = "/" + SECRET_PATH
 SECRET_TOKEN = os.getenv("TELEGRAM_SECRET", "").strip()
-PORT         = int(os.getenv("PORT", "10000"))
+PORT = int(os.getenv("PORT", "10000"))
 
 # ======================
-#   HANDLERY
+#   COMMAND HANDLERY
 # ======================
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    """Základní uvítací zpráva"""
+    await update.message.reply_html(
         "Ahoj Honzo! 🟢 Jedu.\n"
         "/status = kontrola\n"
         "/tip = vyhledávání zápasů (gól do poločasu)\n\n"
-        "🔥 Bot je připravený na Flamengo strategii.",
-        parse_mode=ParseMode.HTML,
+        "🔥 Bot je připravený na Flamengo strategii."
     )
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Vrací stav bota"""
     await update.message.reply_text("✅ Alive – webhook OK, bot běží.")
 
 async def tip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Najde zápasy podle Flamengo logiky – Gól v 1. poločase"""
     tips = find_first_half_goal_candidates(limit=3)
 
     if not tips:
@@ -60,33 +62,35 @@ async def tip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     msg = (
-        "🔥 <b>Flamengo – gól do poločasu (TOP kandidáti)</b>\n"
+        "🔥 <b>Flamengo – Gól do poločasu (TOP kandidáti)</b>\n"
         + "\n\n".join(lines)
         + "\n\n"
-        "Pozn.: Pokud je zdroj dočasně blokovaný (Cloudflare), vidíš fallback návrhy. "
-        "Při plném běhu se přidají přesné statistiky a kurzy."
+        "Pozn.: Pokud Tipsport blokuje přístup, bot vrátí fallback návrhy.\n"
+        "V další verzi přidáme přesné kurzy a statistiky z detailů zápasů. ⚙️"
     )
     await update.message.reply_html(msg)
 
-# echo – jen testovací fallback
 async def echo_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback pro běžné zprávy"""
     if update.message and update.message.text:
-        await update.message.reply_text(f"Echo: {update.message.text[:120]}")
+        await update.message.reply_text("Tip modul připraven – napojíme gól do poločasu.")
 
 # ======================
 #   APLIKACE
 # ======================
+
 def build_app() -> Application:
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start",  start_cmd))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("tip",    tip_cmd))
+    app.add_handler(CommandHandler("tip", tip_cmd))
     app.add_handler(MessageHandler(filters.ALL, echo_all))
     return app
 
 # ======================
 #   MAIN
 # ======================
+
 def main():
     app = build_app()
     app.run_webhook(

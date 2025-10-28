@@ -5,7 +5,6 @@
 import os
 from datetime import datetime
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,7 +13,7 @@ from telegram.ext import (
     filters,
 )
 
-from picks import find_first_half_goal_candidates  # náš rychlý modul (/tip)
+from picks import find_first_half_goal_candidates  # rychlý modul (/tip)
 from sources import analyze_sources                 # širší sken (/tip24)
 
 # ======================
@@ -46,7 +45,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ahoj Honzo! 🟢 Jedu.\n"
         "/status = kontrola\n"
         "/tip = vyhledávání zápasů (gól do poločasu)\n"
-        "/tip24 = širší sken (více zdrojů)\n\n"
+        "/tip24 = širší sken (více zdrojů)\n"
+        "/debug = diagnostika zdrojů\n\n"
         "🔥 Bot je připravený na Flamengo strategii."
     )
 
@@ -109,6 +109,27 @@ async def tip24_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔍 <b>Flamengo /tip24 – rozšířený sken (TOP 5)</b>\n\n" + "\n\n".join(lines)
     )
 
+# --- DEBUG: ukáže, kolik tipů vrátily reálné zdroje vs. fallback ---
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        src = analyze_sources(limit=8) or []
+    except Exception as e:
+        src = []
+    try:
+        fast = find_first_half_goal_candidates(limit=8) or []
+    except Exception as e:
+        fast = []
+
+    now = datetime.now().astimezone().strftime("%d.%m. %H:%M %Z")
+    msg = (
+        "🛠 DEBUG\n"
+        f"- sources.py (rozšířené zdroje): {len(src)} tipů\n"
+        f"- picks.py (rychlý sken/Tipsport): {len(fast)} tipů\n"
+        f"- Now: {now}\n"
+        "Pozn.: Pokud sources=0, běží fallback → proto se opakují stejné páry."
+    )
+    await update.message.reply_text(msg)
+
 async def echo_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fallback pro běžné zprávy"""
     if update.message and update.message.text:
@@ -123,7 +144,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("tip", tip_cmd))
-    app.add_handler(CommandHandler("tip24", tip24_cmd))  # ✅ přidán nový příkaz
+    app.add_handler(CommandHandler("tip24", tip24_cmd))
+    app.add_handler(CommandHandler("debug", debug_cmd))  # ✅ přidáno
     app.add_handler(MessageHandler(filters.ALL, echo_all))
     return app
 

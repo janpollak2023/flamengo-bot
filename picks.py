@@ -1,5 +1,5 @@
 # picks.py — rychlý výběr kandidátů "Gól v 1. poločase"
-# Autor: Kiki pro Honzu ❤️  — verze: ef+ls v3 (ligové přepínače + poháry + hours_window)
+# Autor: Kiki pro Honzu ❤️  — verze: TIPS+EF+LS v3 (hours_window + robust fallback)
 
 from __future__ import annotations
 import os, re, time, random
@@ -16,19 +16,19 @@ from urllib3.util.retry import Retry
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 TZ = timezone(timedelta(hours=1))                       # CET/CEST
-ALLOW_FALLBACK = os.getenv("ALLOW_FALLBACK", "1") == "1"
-STRICT_LEAGUES = os.getenv("STRICT_LEAGUES", "1") == "1"  # ✅ NOVÉ: 0 = nefiltruj ligy
-TIMEOUT = (7, 14)
+ALLOW_FALLBACK      = os.getenv("ALLOW_FALLBACK", "1") == "1"
+STRICT_LEAGUES      = os.getenv("STRICT_LEAGUES", "0") == "1"   # 0 = volnější filtrace
+TIMEOUT             = (7, 14)
+
+# Tipsport kategorie (mobil) – fotbal/hokej lze rozšířit
+TIPSPORT_URL_FOOT   = os.getenv("TIPSPORT_URL_FOOT", "https://m.tipsport.cz/kurzy/fotbal-16")
+TIPSPORT_URL_HOCK   = os.getenv("TIPSPORT_URL_HOCK", "https://m.tipsport.cz/kurzy/ledni-hokej-23")
 
 PREFERRED_LEAGUES = {s.strip().lower() for s in os.getenv(
     "PREFERRED_LEAGUES",
-    # Ligy + POHÁRY (často padaly mimo filtr → rozšířeno)
     "czech, cesko, fortuna, denmark, danish, superliga, belgium, jupiler, austria, bundesliga, "
     "germany, netherlands, eredivisie, scotland, sweden, norway, poland, turkey, portugal, spain, "
-    "england, premier, italy, serie, france, ligue, "
-    "cup, pohar, pohár, fa cup, dfb, dfb-pokal, coppa, coppa italia, copa, copa del rey, "
-    "taca, taça, beker, knvb, knvb beker, tff, super cup, supercupa, superpuchar, pokal, "
-    "rakousky pohar, cesky pohar, slovensky pohar"
+    "england, premier, italy, serie, france, ligue"
 ).split(",")}
 
 # =============== MODEL ===============
@@ -62,14 +62,13 @@ def _session() -> requests.Session:
     return s
 
 def _within_preferred(league_text: str) -> bool:
-    """Pokud STRICT_LEAGUES=0 → propusť vše. Jinak filtruj podle PREFERRED_LEAGUES."""
     if not STRICT_LEAGUES:
         return True
     low = (league_text or "").lower()
     return any(k in low for k in PREFERRED_LEAGUES)
 
-def _ko(dt_h:int, dt_m:int, base:datetime) -> datetime:
-    ko = base.replace(hour=dt_h, minute=dt_m, second=0, microsecond=0)
+def _ko(h:int, m:int, base:datetime) -> datetime:
+    ko = base.replace(hour=h, minute=m, second=0, microsecond=0)
     if ko < base - timedelta(minutes=5):
         ko += timedelta(days=1)
     return ko
@@ -86,17 +85,101 @@ def _conf(rate: float, pace: float) -> int:
 def _dedup_keep_best(tips: Iterable[Tip]) -> List[Tip]:
     seen = {}
     for t in tips:
-        key = (t.match.lower(), t.kickoff.strftime("%Y-%m-%d %H:%M") if t.kickoff else "")
+        key = (t.match.lower().strip(), t.kickoff.strftime("%Y-%m-%d %H:%M") if t.kickoff else "")
         if key not in seen or t.confidence > seen[key].confidence:
             seen[key] = t
     return list(seen.values())
 
-# =============== SCRAPERY ===============
+# =============== TISPPORT SCRAPER (MOBIL) ===============
+def _scrape_tipsport_list(base_url: str, day_shift: int) -> List[Tip]:
+    """
+    Parsuje mobilní Tipsport katalog (např. fotbal-16).
+    day_shift: 0=dnes, 1=zítra (pokusně přes query filtr; pokud není, bereme vše a posun času)
+    """
+    base = datetime.now(timezone.utc).astimezone(TZ) + timedelta(days=day_shift)
+    # zkus “Zítra” filtr – Tipsport často používá param timeFilter
+    url = base_url
+    if day_shift == 1:
+        url = base_url + "?timeFilter=tomorrow"
+
+    s = _session()
+    try:
+        r = s.get(url, timeout=TIMEOUT)
+        if r.status_code != 200:
+            return []
+        html = r.text
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    tips: List[Tip] = []
+
+    # Struktura m.tipsport.cz se liší; chytáme co nejuniverzálněji:
+    # - čas „HH:MM“
+    # - dvojice týmů s „-“ nebo „–“
+    # - vedle/na řádku bývá soutěž
+    rows = soup.find_all(string=re.compile(r"\d{1,2}:\d{2}"))[:800]
+    for node in rows:
+        line = node if isinstance(node, str) else node.get_text(" ", strip=True)
+        # dohledáme okolní kontejner kvůli názvu a soutěži
+        item = node if hasattr(node, "parent") else None
+        blk = item.parent if item else None
+        text_blk = ""
+        if blk:
+            text_blk = blk.get_text(" ", strip=True)
+
+        # čas
+        mt = re.search(r"(\d{1,2}):(\d{2})", line) or re.search(r"(\d{1,2}):(\d{2})", text_blk)
+        if not mt:
+            continue
+        hh, mm = int(mt.group(1)), int(mt.group(2))
+
+        # match pair: zkusíme v bloku najít „TýmA - TýmB“ nebo „TýmA – TýmB“
+        src = text_blk if text_blk else line
+        mp = re.search(r"([^\n\-–]+?)\s*[–-]\s*([^\n]+)", src)
+        if not mp:
+            # fallback – občas je název samostatně ve dvou <span>
+            # v tom případě raději přeskoč, aby nebyly šum zápasy
+            continue
+
+        home = mp.group(1).strip()
+        away = mp.group(2).strip()
+
+        # liga/soutěž – často je nad/vedle, zkusíme blízké labely
+        league = "Tipsport"
+        wrap = blk
+        if wrap:
+            # vezmeme krátký sousední text, který nevypadá jako kurzy/čísla
+            cand = wrap.find_previous(["h2", "h3", "div", "span"])
+            if cand:
+                txt = cand.get_text(" ", strip=True)
+                if txt and not re.fullmatch(r"[\d\.\s:]+", txt):
+                    league = txt
+
+        # filtrace ligy (volitelná)
+        if not _within_preferred(league):
+            continue
+
+        ko = _ko(hh, mm, base)
+        tips.append(Tip(
+            match=f"{home} – {away}",
+            league=league,
+            market="Gól v 1. poločase: ANO (Over 0.5 HT)",
+            confidence=_conf(0.75, 1.12),          # Tipsport list: bereme o chlup víc než EF/LS
+            window=_window_from_avg(20.0),
+            reason="Tipsport (mobil) – reálná nabídka, očekávaný brzký zásah.",
+            odds=None,                              # kurzy doplníme v detail scrapers v další iteraci
+            url=url,
+            kickoff=ko,
+        ))
+
+        if len(tips) >= 120:
+            break
+
+    return tips
+
+# =============== EUROFOTBAL ===============
 def _scrape_eurofotbal(day_shift: int) -> List[Tip]:
-    """
-    Eurofotbal – rozpis dne. day_shift: 0=dnes, 1=zítra
-    Používáme široké selektory + regexy, aby to přežilo šablony.
-    """
     base = datetime.now(timezone.utc).astimezone(TZ) + timedelta(days=day_shift)
     url = f"https://www.eurofotbal.cz/zapasy/?d={day_shift}"
     s = _session()
@@ -112,9 +195,8 @@ def _scrape_eurofotbal(day_shift: int) -> List[Tip]:
     tips: List[Tip] = []
     blocks = soup.select("div.match, li.match, tr.match, div.zapas, li.zapas")
     if not blocks:
-        # fallback: scan text řádkově
         text = soup.get_text("\n", strip=True)
-        rows = [ln for ln in text.split("\n") if ":" in ln and " - " in ln]
+        rows = [ln for ln in text.split("\n") if ":" in ln and (" - " in ln or " – " in ln)]
         blocks = rows[:150]
 
     def extract_pair(node) -> Optional[tuple[str,str]]:
@@ -156,20 +238,17 @@ def _scrape_eurofotbal(day_shift: int) -> List[Tip]:
             market="Gól v 1. poločase: ANO (Over 0.5 HT)",
             confidence=_conf(0.74, 1.10),
             window=_window_from_avg(21.0),
-            reason="EF: ligové tempo 1H nad průměrem.",
+            reason="Eurofotbal: ligové tempo 1H nad průměrem.",
             odds=None,
             url=url,
             kickoff=ko,
         ))
-        if len(tips) >= 24:
+        if len(tips) >= 60:
             break
     return tips
 
+# =============== LIVESPORT (MOBIL) ===============
 def _scrape_livesport_mobile(day_shift:int) -> List[Tip]:
-    """
-    Mobilní Livesport (server-renderované HTML).
-    day_shift: 0=dnes, 1=zítra
-    """
     base = datetime.now(timezone.utc).astimezone(TZ) + timedelta(days=day_shift)
     url = "https://m.livesport.cz/fotbal/"
     s = _session()
@@ -188,12 +267,12 @@ def _scrape_livesport_mobile(day_shift:int) -> List[Tip]:
         line = row if isinstance(row, str) else row.get_text(" ", strip=True)
         if " - " not in line and " – " not in line:
             continue
-        mtime = re.search(r"(\d{1,2}):(\d{2})", line)
-        mpair = re.search(r"([^\n\-–]+?)\s*[–-]\s*([^\n]+)", line)
-        if not (mtime and mpair):
+        mt = re.search(r"(\d{1,2}):(\d{2})", line)
+        mp = re.search(r"([^\n\-–]+?)\s*[–-]\s*([^\n]+)", line)
+        if not (mt and mp):
             continue
-        hh, mm = int(mtime.group(1)), int(mtime.group(2))
-        home, away = mpair.group(1).strip(), mpair.group(2).strip()
+        hh, mm = int(mt.group(1)), int(mt.group(2))
+        home, away = mp.group(1).strip(), mp.group(2).strip()
         league = "Livesport"
         ko = _ko(hh, mm, base)
         tips.append(Tip(
@@ -202,12 +281,12 @@ def _scrape_livesport_mobile(day_shift:int) -> List[Tip]:
             market="Gól v 1. poločase: ANO (Over 0.5 HT)",
             confidence=_conf(0.72, 1.05),
             window=_window_from_avg(22.0),
-            reason="LS: rychlý sken rozpisu – brzký gól očekáván.",
+            reason="Livesport (mobil): rychlý rozpis – oček. brzký gól.",
             odds=None,
             url=url,
             kickoff=ko,
         ))
-        if len(tips) >= 24:
+        if len(tips) >= 60:
             break
     return tips
 
@@ -232,7 +311,7 @@ def _fallback_candidates(n: int = 8) -> List[Tip]:
     base = random.sample(_POOL, k=min(n, len(_POOL)))
     out: List[Tip] = []
     for i, (match, league) in enumerate(base):
-        hh = 16 + (i % 6)  # 16–21
+        hh = 16 + (i % 6)   # 16–21
         mm = 0 if i % 2 == 0 else 30
         ko = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if ko < now:
@@ -253,38 +332,46 @@ def _fallback_candidates(n: int = 8) -> List[Tip]:
 # =============== HLAVNÍ FUNKCE ===============
 def find_first_half_goal_candidates(limit: int = 3, hours_window: int = 24) -> List[Tip]:
     """
-    Rychlý výběr kandidátů s časovým oknem:
-      - sesbírá Eurofotbal (dnes+zítra) + mobilní Livesport,
-      - odfiltruje jen zápasy s výkopem v <teď .. teď+hours_window>,
-      - deduplikace a seřazení podle confidence a času,
-      - pokud nic a ALLOW_FALLBACK=1 → řízený fallback; jinak prázdný list.
+    Pipeline (nejbezpečnější pořadí):
+      1) Tipsport mobil (dnes + zítra),
+      2) Eurofotbal (dnes + zítra),
+      3) Livesport mobil (dnes + zítra),
+      4) filtr do okna <teď .. teď+hours_window>,
+      5) deduplikace + řazení,
+      6) pokud nic a ALLOW_FALLBACK → řízený fallback.
     """
     now = datetime.now(timezone.utc).astimezone(TZ)
     until = now + timedelta(hours=max(1, min(72, hours_window)))
 
     tips: List[Tip] = []
-    try:
-        tips += _scrape_eurofotbal(0)  # dnes
-    except Exception:
-        pass
-    try:
-        tips += _scrape_eurofotbal(1)  # zítra
-    except Exception:
-        pass
-    if len(tips) < 4:
-        time.sleep(0.2)
-        try:
-            tips += _scrape_livesport_mobile(0)  # dnes (doplněk)
-        except Exception:
-            pass
-    if len(tips) < 4:
-        time.sleep(0.2)
-        try:
-            tips += _scrape_livesport_mobile(1)  # zítra (doplněk)
-        except Exception:
-            pass
 
-    # filtr na časové okno + deduplikace
+    # 1) Tipsport (reálná nabídka)
+    try:
+        tips += _scrape_tipsport_list(TIPSPORT_URL_FOOT, 0)
+    except Exception:
+        pass
+    try:
+        tips += _scrape_tipsport_list(TIPSPORT_URL_FOOT, 1)
+    except Exception:
+        pass
+
+    # 2) Eurofotbal
+    if len(tips) < 4:
+        time.sleep(0.2)
+        try: tips += _scrape_eurofotbal(0)
+        except Exception: pass
+        try: tips += _scrape_eurofotbal(1)
+        except Exception: pass
+
+    # 3) Livesport
+    if len(tips) < 4:
+        time.sleep(0.2)
+        try: tips += _scrape_livesport_mobile(0)
+        except Exception: pass
+        try: tips += _scrape_livesport_mobile(1)
+        except Exception: pass
+
+    # 4) filtr na časové okno
     filtered: List[Tip] = []
     for t in tips:
         if t.kickoff is None:
@@ -293,12 +380,12 @@ def find_first_half_goal_candidates(limit: int = 3, hours_window: int = 24) -> L
             continue
         filtered.append(t)
 
+    # 5) deduplikace + sort (confidence desc, kickoff asc)
     filtered = _dedup_keep_best(filtered)
     filtered.sort(key=lambda t: (-t.confidence, t.kickoff.timestamp() if t.kickoff else 1e15))
 
-    if not filtered:
-        if ALLOW_FALLBACK:
-            return _fallback_candidates(10)[:max(1, limit)]
-        return []
+    # 6) nouzový návrat
+    if not filtered and ALLOW_FALLBACK:
+        return _fallback_candidates(10)[:max(1, limit)]
 
     return filtered[:max(1, limit)]

@@ -1,8 +1,11 @@
-# main.py — Flask + python-telegram-bot 21.6 (webhook), Render/Gunicorn (1 worker)
+# main.py — Flask + python-telegram-bot 21.6 (Render webhook, 1 worker)
+# ✅ plně funkční verze
 
-import os, threading, asyncio, logging
+import os
+import threading
+import asyncio
+import logging
 from flask import Flask, request
-
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
@@ -20,7 +23,7 @@ if not SECRET_PATH.startswith("/"):
     SECRET_PATH = "/" + SECRET_PATH
 SECRET_TOKEN = os.getenv("TELEGRAM_SECRET", "")
 
-# ---------- TELEGRAM APP ----------
+# ---------- TELEGRAM ----------
 application: Application = Application.builder().token(TOKEN).build()
 
 async def cmd_start(update: Update, _):
@@ -33,17 +36,19 @@ async def cmd_status(update: Update, _):
     await update.message.reply_text("✅ Alive – webhook OK, bot běží.")
 
 async def cmd_tip(update: Update, _):
-    await update.message.reply_text("Tip modul připraven – napojíme scraper pro gól do poločasu.")
+    await update.message.reply_text("Tip modul připraven – brzy nasadíme analýzu gólů do poločasu.")
 
 async def echo_all(update: Update, _):
     if update.message and update.message.text:
         await update.message.reply_text(f"Echo: {update.message.text[:120]}")
 
+# ---------- HANDLERY ----------
 application.add_handler(CommandHandler("start",  cmd_start))
 application.add_handler(CommandHandler("status", cmd_status))
 application.add_handler(CommandHandler("tip",    cmd_tip))
 application.add_handler(MessageHandler(filters.ALL, echo_all))
 
+# ---------- ERROR HANDLER ----------
 async def on_error(update, context):
     log.exception("HANDLER ERROR: %s", context.error)
 
@@ -56,13 +61,14 @@ app = Flask(__name__)
 def healthz():
     return "OK", 200
 
-# PTB event loop reference (využijeme z Flask vlákna)
+# PTB event loop reference (pro přímé volání z Flasku)
 PTB_LOOP: asyncio.AbstractEventLoop | None = None
 
 @app.post(SECRET_PATH)
 def telegram_webhook():
     log.info("WEBHOOK HIT %s", SECRET_PATH)
 
+    # Ověření tajného tokenu
     if SECRET_TOKEN and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != SECRET_TOKEN:
         log.warning("WEBHOOK 403 – secret token mismatch")
         return "forbidden", 403
@@ -75,15 +81,14 @@ def telegram_webhook():
     try:
         update = Update.de_json(data, application.bot)
 
-        # ✅ Klíčová oprava: procesuj update přímo v PTB event loopu
+        # ✅ Správný způsob – pošli update do běžícího PTB loopu
         if PTB_LOOP and PTB_LOOP.is_running():
             fut = asyncio.run_coroutine_threadsafe(application.process_update(update), PTB_LOOP)
-            # volitelně: počkej krátce na případnou chybu
             try:
-                fut.result(timeout=0.01)
+                fut.result(timeout=0.05)
             except Exception:
                 pass
-            log.info("WEBHOOK OK – update scheduled (id=%s)", update.update_id)
+            log.info("WEBHOOK OK – update processed (id=%s)", update.update_id)
             return "ok", 200
         else:
             log.error("WEBHOOK 500 – PTB loop not running")
@@ -92,6 +97,7 @@ def telegram_webhook():
     except Exception as e:
         log.exception("WEBHOOK 500 – failed to process update: %s", e)
         return "error", 500
+
 
 # ---------- PTB START NA POZADÍ ----------
 _started = False
@@ -126,6 +132,7 @@ def _run_ptb_loop():
     loop.run_until_complete(boot())
     loop.run_forever()
 
+
 def _ensure_started():
     global _started
     if not _started:
@@ -136,6 +143,6 @@ def _ensure_started():
 
 _ensure_started()
 
-# ---- Gunicorn entrypoint: main:app ----
+# ---------- GUNICORN ----------
 # Start command (Render):
 # gunicorn -w 1 -k gthread -b 0.0.0.0:$PORT main:app

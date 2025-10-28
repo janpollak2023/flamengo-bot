@@ -1,8 +1,8 @@
 # picks.py — rychlý výběr kandidátů "Gól v 1. poločase"
-# Autor: Kiki pro Honzu ❤️  — verze: ef+ls v1
+# Autor: Kiki pro Honzu ❤️  — verze: ef+ls v2 (podpora hours_window)
 
 from __future__ import annotations
-import os, re, time, math, random
+import os, re, time, random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Iterable
@@ -112,19 +112,18 @@ def _scrape_eurofotbal(day_shift: int) -> List[Tip]:
     def extract_pair(node) -> Optional[tuple[str,str]]:
         txt = node.get_text(" ", strip=True) if hasattr(node, "get_text") else str(node)
         m = re.search(r"([^\n\-–]+?)\s*[–-]\s*([^\n]+)", txt)
-        if not m: 
+        if not m:
             return None
         return m.group(1).strip(), m.group(2).strip()
 
     def extract_time(node) -> Optional[tuple[int,int]]:
         txt = node.get_text(" ", strip=True) if hasattr(node, "get_text") else str(node)
         tm = re.search(r"(\d{1,2}):(\d{2})", txt)
-        if not tm: 
+        if not tm:
             return None
         return int(tm.group(1)), int(tm.group(2))
 
     def extract_league(node) -> str:
-        # hledej poblíž nadpisy/štítky
         if hasattr(node, "find_previous"):
             cand = node.find_previous(["h2","h3","h4","div","span"])
             if cand:
@@ -164,7 +163,6 @@ def _scrape_livesport_mobile(day_shift:int) -> List[Tip]:
     day_shift: 0=dnes, 1=zítra
     """
     base = datetime.now(timezone.utc).astimezone(TZ) + timedelta(days=day_shift)
-    # univerzální rozpis fotbalu (mobil)
     url = "https://m.livesport.cz/fotbal/"
     s = _session()
     try:
@@ -177,13 +175,11 @@ def _scrape_livesport_mobile(day_shift:int) -> List[Tip]:
     soup = BeautifulSoup(html, "html.parser")
     tips: List[Tip] = []
 
-    # mobilní řádky utkání často obsahují čas + ' - ' mezi týmy
     rows = soup.find_all(string=re.compile(r"\d{1,2}:\d{2}"))[:400]
     for row in rows:
         line = row if isinstance(row, str) else row.get_text(" ", strip=True)
         if " - " not in line and " – " not in line:
             continue
-        # pokus o parsování na jedné řádce
         mtime = re.search(r"(\d{1,2}):(\d{2})", line)
         mpair = re.search(r"([^\n\-–]+?)\s*[–-]\s*([^\n]+)", line)
         if not (mtime and mpair):
@@ -247,39 +243,54 @@ def _fallback_candidates(n: int = 8) -> List[Tip]:
     return out
 
 # =============== HLAVNÍ FUNKCE ===============
-def find_first_half_goal_candidates(limit: int = 3) -> List[Tip]:
-    tips: List[Tip] = []
+def find_first_half_goal_candidates(limit: int = 3, hours_window: int = 24) -> List[Tip]:
+    """
+    Rychlý výběr kandidátů s časovým oknem:
+      - sesbírá Eurofotbal (dnes+zítra) + mobilní Livesport,
+      - odfiltruje jen zápasy s výkopem v <teď .. teď+hours_window>,
+      - deduplikace a seřazení podle confidence a času,
+      - pokud nic a ALLOW_FALLBACK=1 → řízený fallback; jinak prázdný list.
+    """
+    now = datetime.now(timezone.utc).astimezone(TZ)
+    until = now + timedelta(hours=max(1, min(72, hours_window)))
 
+    tips: List[Tip] = []
     try:
-        tips += _scrape_eurofotbal(0)
+        tips += _scrape_eurofotbal(0)  # dnes
     except Exception:
         pass
-
+    try:
+        tips += _scrape_eurofotbal(1)  # zítra
+    except Exception:
+        pass
     if len(tips) < 4:
         time.sleep(0.2)
         try:
-            tips += _scrape_eurofotbal(1)
+            tips += _scrape_livesport_mobile(0)  # dnes (doplněk)
         except Exception:
             pass
-
     if len(tips) < 4:
         time.sleep(0.2)
         try:
-            tips += _scrape_livesport_mobile(0)
+            tips += _scrape_livesport_mobile(1)  # zítra (doplněk)
         except Exception:
             pass
 
-    if len(tips) < 4:
-        time.sleep(0.2)
-        try:
-            tips += _scrape_livesport_mobile(1)
-        except Exception:
-            pass
+    # filtr na časové okno + deduplikace
+    filtered: List[Tip] = []
+    for t in tips:
+        if t.kickoff is None:
+            continue
+        if not (now <= t.kickoff <= until):
+            continue
+        filtered.append(t)
 
-    tips = _dedup_keep_best(tips)
-    tips.sort(key=lambda t: (-t.confidence, t.kickoff.timestamp() if t.kickoff else 1e15))
+    filtered = _dedup_keep_best(filtered)
+    filtered.sort(key=lambda t: (-t.confidence, t.kickoff.timestamp() if t.kickoff else 1e15))
 
-    if not tips and ALLOW_FALLBACK:
-        tips = _fallback_candidates(10)
+    if not filtered:
+        if ALLOW_FALLBACK:
+            return _fallback_candidates(10)[:max(1, limit)]
+        return []
 
-    return tips[:max(1, limit)]
+    return filtered[:max(1, limit)]

@@ -66,7 +66,12 @@ def telegram_webhook():
         application.create_task(application.process_update(update))
         log.info("WEBHOOK OK – update processed (id=%s)", update.update_id)
         return "ok", 200
+from telegram.error import TelegramError
 
+async def on_error(update, context):
+    log.exception("HANDLER ERROR: %s | cause=%s", context.error, getattr(context, "error", None))
+
+application.add_error_handler(on_error)
     except Exception as e:
         log.exception("WEBHOOK 500 – failed to process update: %s", e)
         return "error", 500

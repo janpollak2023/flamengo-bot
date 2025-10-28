@@ -6,12 +6,10 @@ from __future__ import annotations
 
 import os
 import re
-import json
-import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -23,7 +21,10 @@ UA = (
     "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 )
 
-TZ = timezone(timedelta(hours=1))  # CET/CEST – jednoduché, Render běží v UTC
+# CZ čas (CET/CEST) – na Renderu bývá UTC, proto přidáme +1 s auto DST ručně neřešíme,
+# ale pro filtrování a zobrazení stačí držet jednotnou TZ.
+TZ = timezone(timedelta(hours=1))
+
 ALLOW_FALLBACK = os.getenv("ALLOW_FALLBACK", "1") == "1"
 PREFERRED_LEAGUES = {s.strip().lower() for s in os.getenv(
     "PREFERRED_LEAGUES",
@@ -31,6 +32,7 @@ PREFERRED_LEAGUES = {s.strip().lower() for s in os.getenv(
 ).split(",")}
 
 TIMEOUT = (7, 12)  # connect, read
+COOLDOWN_HOURS = 2  # anti-repeat: min. rozestup KO mezi vybranými tipy
 
 # =============== DATOVÝ MODEL ===============
 
@@ -80,7 +82,7 @@ def _kickoff_today_fallback(hour: int, minute: int) -> datetime:
     return ko
 
 def _score_to_window(avg_minute: float) -> str:
-    # Převede průměrnou minutu prvního gólu na okno (±10 min)
+    # Převede průměrnou minutu prvního gólu na okno (±8–10 min)
     a = max(6, int(avg_minute) - 8)
     b = min(44, int(avg_minute) + 8)
     return f"{a}’–{b}’"
@@ -92,6 +94,42 @@ def _conf_from_stats(rate: float, pace: float) -> int:
     """
     base = 60 + 30 * rate + 10 * (pace - 1.0)
     return max(55, min(95, int(round(base))))
+
+def _in_window(ko: Optional[datetime], hours_window: int) -> bool:
+    """True, pokud je kickoff v intervalu [now, now+hours_window]."""
+    if not ko:
+        return False
+    now = datetime.now(timezone.utc).astimezone(TZ)
+    return now <= ko <= now + timedelta(hours=hours_window)
+
+def _dedupe_and_cooldown(cands: List[Tip], hours_cooldown: int = COOLDOWN_HOURS) -> List[Tip]:
+    """Odstraní duplicitní zápasy a udrží min. rozestup KO mezi vybranými tipy."""
+    # deduplikace názvu + přesného času
+    seen: set[Tuple[str, str]] = set()
+    tmp: List[Tip] = []
+    for t in cands:
+        key = (t.match.lower(), (t.kickoff or datetime.min).strftime("%Y-%m-%d %H:%M"))
+        if key in seen:
+            continue
+        seen.add(key)
+        tmp.append(t)
+
+    # cooldown podle KO
+    tmp.sort(key=lambda x: (x.kickoff or datetime.max))
+    out: List[Tip] = []
+    for t in tmp:
+        if not out:
+            out.append(t)
+            continue
+        ok = True
+        for s in out:
+            if t.kickoff and s.kickoff and abs((t.kickoff - s.kickoff).total_seconds()) < hours_cooldown * 3600:
+                ok = False
+                break
+        if ok:
+            out.append(t)
+    # pro další třídění necháme později
+    return out
 
 # =============== SCRAPERY (LEHKÉ) ===============
 
@@ -107,11 +145,12 @@ def _eurofotbal_list() -> List[Tip]:
     rows = soup.select("div#content div.matches div.match") or soup.select("div.match")
     now = datetime.now(timezone.utc).astimezone(TZ)
 
-    for m in rows[:120]:
-        home = (m.select_one(".team.home") or m.select_one(".team-home") or m.select_one(".home")).get_text(strip=True) if m.select_one(".team.home") or m.select_one(".team-home") or m.select_one(".home") else ""
-        away = (m.select_one(".team.away") or m.select_one(".team-away") or m.select_one(".away")).get_text(strip=True) if m.select_one(".team.away") or m.select_one(".team-away") or m.select_one(".away") else ""
+    for m in rows[:160]:
+        home_node = m.select_one(".team.home") or m.select_one(".team-home") or m.select_one(".home")
+        away_node = m.select_one(".team.away") or m.select_one(".team-away") or m.select_one(".away")
+        home = home_node.get_text(strip=True) if home_node else ""
+        away = away_node.get_text(strip=True) if away_node else ""
         if not home or not away:
-            # alternativně z title
             tnode = m.get("title") or ""
             if " - " in tnode:
                 home, away = [x.strip() for x in tnode.split(" - ", 1)]
@@ -119,7 +158,6 @@ def _eurofotbal_list() -> List[Tip]:
         league = (m.select_one(".competition") or m.select_one(".league") or m.select_one(".tournament"))
         league_text = league.get_text(" ", strip=True) if league else "Fotbal"
 
-        # čas (HH:MM)
         time_node = (m.select_one(".time") or m.select_one(".kickoff") or m.select_one(".score"))
         ko = None
         if time_node:
@@ -127,7 +165,6 @@ def _eurofotbal_list() -> List[Tip]:
             if tm:
                 hh, mm = int(tm.group(1)), int(tm.group(2))
                 ko = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-                # pokud je to už po výkopu → dej zítřek
                 if ko < now - timedelta(minutes=5):
                     ko += timedelta(days=1)
 
@@ -137,8 +174,7 @@ def _eurofotbal_list() -> List[Tip]:
             continue
 
         match = f"{home} – {away}"
-        # jednoduchá heuristika: bez reálných kurzů použij default odds None a důvod
-        window = _score_to_window(21.0)  # konzervativní okno
+        window = _score_to_window(21.0)
         conf = _conf_from_stats(rate=0.74, pace=1.1)
         tips.append(Tip(
             match=match,
@@ -152,15 +188,13 @@ def _eurofotbal_list() -> List[Tip]:
             kickoff=ko,
         ))
 
-        if len(tips) >= 12:
+        if len(tips) >= 30:
             break
 
     return tips
 
 def _footystats_tomorrow() -> List[Tip]:
-    """
-    FootyStats 'tomorrow' stránka – někdy blokuje; když projde, přidáme pár kvalitních tipů.
-    """
+    """FootyStats 'tomorrow' – pokud projde, přidáme několik kvalitních tipů."""
     url = "https://footystats.org/cz/tomorrow/"
     html = _req(url)
     tips: List[Tip] = []
@@ -171,12 +205,12 @@ def _footystats_tomorrow() -> List[Tip]:
     cards = soup.select("table tr") or soup.select(".match-row")
     now = datetime.now(timezone.utc).astimezone(TZ)
 
-    for row in cards[:120]:
-        txt = row.get_text(" ", strip=True).lower()
+    for row in cards[:160]:
+        text_all = row.get_text(" ", strip=True)
+        txt = text_all.lower()
         if not txt or " - " not in txt:
             continue
 
-        # název soutěže (často je poblíž)
         league = "FootyStats"
         league_node = row.find_previous("h2")
         if league_node:
@@ -185,22 +219,19 @@ def _footystats_tomorrow() -> List[Tip]:
         if not _within_preferred(league):
             continue
 
-        # tým vs tým
-        m = re.search(r"([^\n-]+?)\s*-\s*([^\n]+)", row.get_text(" ", strip=True))
+        m = re.search(r"([^\n-]+?)\s*-\s*([^\n]+)", text_all)
         if not m:
             continue
         home = m.group(1).strip()
         away = m.group(2).strip()
         match = f"{home} – {away}"
 
-        # čas (pokud najdeme)
         ko = None
         tm = re.search(r"(\d{1,2}):(\d{2})", txt)
         if tm:
             hh, mm = int(tm.group(1)), int(tm.group(2))
             ko = _kickoff_today_fallback(hh, mm)
 
-        # velmi hrubá heuristika z textu
         window = _score_to_window(20.0)
         conf = _conf_from_stats(rate=0.76, pace=1.15)
 
@@ -216,19 +247,21 @@ def _footystats_tomorrow() -> List[Tip]:
             kickoff=ko,
         ))
 
-        if len(tips) >= 10:
+        if len(tips) >= 20:
             break
 
     return tips
 
 # =============== FALLBACK ===============
 
-def _fallback_candidates() -> List[Tip]:
+def _fallback_candidates(hours_window: int) -> List[Tip]:
     """
-    Nouzový, ale dynamický fallback: vytvoří 6 tipů s rozumnými časy do budoucna,
-    aby se neopakovaly pořád stejné datumy.
+    Dynamický fallback: vytvoří tipy s časy posunutými tak, aby
+    spadaly do požadovaného okna.
     """
     now = datetime.now(timezone.utc).astimezone(TZ)
+    end = now + timedelta(hours=hours_window)
+
     base = [
         ("Midtjylland – AGF Aarhus", "Dánsko", 19, 0),
         ("Genk – Standard", "Belgie", 18, 30),
@@ -240,14 +273,18 @@ def _fallback_candidates() -> List[Tip]:
     tips: List[Tip] = []
     for i, (match, league, hh, mm) in enumerate(base):
         ko = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if ko < now:
-            ko += timedelta(days=1 if i < 3 else 2)
+        # posuň na nejbližší budoucnost
+        while ko < now:
+            ko += timedelta(days=1)
+        # a pokud se nevejde do okna, přeskoč
+        if ko > end:
+            continue
         tips.append(Tip(
             match=match,
             league=league,
             market="Gól v 1. poločase: ANO (Over 0.5 HT)",
             confidence=88 - i*2 if i < 3 else 82 - (i-3)*2,
-            window=_score_to_window(20 + i),  # trochu variace
+            window=_score_to_window(20 + i),
             reason="Fallback: útočné vstupy do zápasu / stabilně gólové 1H.",
             odds=None,
             url=None,
@@ -257,49 +294,50 @@ def _fallback_candidates() -> List[Tip]:
 
 # =============== HLAVNÍ FUNKCE ===============
 
-def find_first_half_goal_candidates(limit: int = 3) -> List[Tip]:
+def find_first_half_goal_candidates(limit: int = 3, hours_window: int = 24) -> List[Tip]:
     """
     Rychlý výběr kandidátů:
       1) zkus Eurofotbal (lehký seznam s časy),
       2) zkus FootyStats 'tomorrow',
-      3) spoj, odfiltruj duplicity, seřaď podle confidence a času,
-      4) pokud nic → řízený fallback (pokud ALLOW_FALLBACK=true).
+      3) spoj, odfiltruj duplicity, aplikuj časové okno a cooldown,
+      4) seřaď (confidence DESC, kickoff ASC),
+      5) pokud nic → řízený fallback (pokud ALLOW_FALLBACK=true) v rámci okna.
     """
     candidates: List[Tip] = []
 
+    # 1) Eurofotbal
     try:
         ef = _eurofotbal_list()
         candidates.extend(ef)
     except Exception:
         pass
 
-    # krátké zpoždění, ať nejsme agresivní
+    # drobné zpoždění, ať nejsme agresivní
     if not candidates:
         time.sleep(0.2)
 
+    # 2) FootyStats
     try:
         ft = _footystats_tomorrow()
         candidates.extend(ft)
     except Exception:
         pass
 
-    # deduplikace podle názvu utkání (case-insensitive)
-    uniq = {}
-    for t in candidates:
-        key = (t.match.lower(), (t.kickoff or datetime.min).strftime("%Y-%m-%d %H:%M"))
-        if key not in uniq:
-            uniq[key] = t
+    # 3) časové okno a deduplikace + cooldown
+    # filtr na okno [now..now+hours_window]
+    candidates = [t for t in candidates if _in_window(t.kickoff, hours_window)]
+    candidates = _dedupe_and_cooldown(candidates, COOLDOWN_HOURS)
 
-    candidates = list(uniq.values())
-
-    # seřadit: nejdřív vyšší confidence, pak nejbližší kickoff
+    # 4) seřaď: vyšší confidence → dřívější kickoff
     def sort_key(t: Tip):
         ts = t.kickoff.timestamp() if t.kickoff else 1e15
         return (-t.confidence, ts)
 
     candidates.sort(key=sort_key)
 
+    # 5) fallback v rámci okna
     if not candidates and ALLOW_FALLBACK:
-        candidates = _fallback_candidates()
+        candidates = _fallback_candidates(hours_window)
 
+    # limit
     return candidates[:max(1, limit)]

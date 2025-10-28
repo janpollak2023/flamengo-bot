@@ -3,6 +3,7 @@
 # Autor: Kiki pro Honzu ❤️
 
 import os
+from datetime import datetime
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -44,6 +45,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def tip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Najde zápasy podle Flamengo logiky – Gól v 1. poločase"""
+
+    def fmt_ko(dt: datetime | None) -> str:
+        # zobrazí výkop v místním čase zařízení (CZ bude OK)
+        return dt.astimezone(tz=None).strftime("%d.%m. %H:%M") if dt else "neznámé"
+
     tips = find_first_half_goal_candidates(limit=3)
 
     if not tips:
@@ -54,8 +60,9 @@ async def tip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, t in enumerate(tips, 1):
         link = f"\n🔗 {t.url}" if t.url else ""
         kurz = f" @ {t.odds:.2f}" if t.odds else ""
+        ko = f"🕒 {fmt_ko(t.kickoff)}"
         lines.append(
-            f"#{i} ⚽ <b>{t.match}</b> ({t.league})\n"
+            f"#{i} ⚽ <b>{t.match}</b> ({t.league}) — {ko}\n"
             f"   Sázka: <b>{t.market}{kurz}</b>\n"
             f"   Důvěra: <b>{t.confidence}%</b> | Okno: <b>{t.window}</b>\n"
             f"   Důvod: {t.reason}{link}"
